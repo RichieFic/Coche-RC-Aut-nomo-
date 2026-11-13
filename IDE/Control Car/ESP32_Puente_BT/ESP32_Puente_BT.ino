@@ -13,6 +13,9 @@
  *     partia las lineas largas del STM32 (la linea DER: mide mas de 300).
  *     Ahora reenvia los bytes tal como llegan.
  *
+ *  3. Control proporcional: las lineas que empiezan con '#' (las manda
+ *     control_carro.py con el control de Xbox o el teclado) pasan completas.
+ *
  * Se conserva el nombre Bluetooth "ESP32-S-MCRP", asi que no hace falta
  * volver a emparejar.
  *
@@ -49,12 +52,32 @@ const bool ECO_USB = false;
 
 uint8_t bufferTelemetria[256];
 
+// Lineas del control proporcional ("#M<izq>,<der>\n", de control_carro.py):
+// se reenvian completas y sin filtrar.
+bool enLineaControl = false;
+uint8_t largoLineaControl = 0;
+
 // ==========================================
 // COMANDOS: Bluetooth / USB -> STM32
 // ==========================================
 
 void procesarCaracterComando(char c)
 {
+    // Linea del control proporcional: pasa tal cual hasta el fin de linea
+    if (c == '#')
+    {
+        enLineaControl = true;
+        largoLineaControl = 0;
+    }
+    if (enLineaControl)
+    {
+        SerialSTM32.write(c);
+        largoLineaControl++;
+        if (c == '\n' || largoLineaControl > 20)
+            enLineaControl = false;
+        return;
+    }
+
     // Ignorar Enter y salto de linea
     if (c == '\r' || c == '\n')
         return;

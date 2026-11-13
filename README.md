@@ -21,6 +21,7 @@ Firmware de un carro autónomo de tracción diferencial basado en una **NUCLEO-F
 | `IDE/Control Car/Control Car/Core/Src/gps_neo6m.c` | Driver del GPS NEO-6M |
 | `IDE/Control Car/ESP32_Puente_BT/` | Sketch de Arduino: puente Bluetooth–UART para la ESP32 (deja pasar `w a s d q` y `G`). Es el que tiene cargado la ESP32 |
 | `IDE/Control Car/ESP32_Original/` | Sketch original de la ESP32, que solo reenvía `F B L R S I` |
+| `IDE/Control Car/Control_PC/` | Programa en Python para manejar con el control de Xbox o el teclado |
 | `Richie's version/` | CAD en SolidWorks: ensamble principal, piezas impresas, `STL/` para imprimir y `COTS/` con modelos de componentes comerciales |
 | `GG´s version/` | CAD en SolidWorks de otra versión del chasis |
 
@@ -85,6 +86,26 @@ Después de soltar el botón, el LED parpadea 1.5 s antes de que el carro se mue
 | `B` / `L` | Atrás / izquierda de forma continua, hasta recibir `S` |
 | `G` | Muestra los giros guardados en flash |
 
+### Control de Xbox o teclado desde la compu
+
+El programa `IDE/Control Car/Control_PC/control_carro.py` permite avanzar y girar a la vez, con velocidad proporcional. No necesita instalar nada además de Python.
+
+```
+python control_carro.py
+```
+
+Al arrancar pregunta el modo:
+
+| Modo | Manejo | Botones / teclas |
+|---|---|---|
+| Control de Xbox | RT acelera, LT reversa, stick izquierdo gira | B parar, A giro 90°, Y evasión, X giros guardados, Back salir |
+| Teclado | W/S adelante/atrás, A/D girar (combinables, Shift = más rápido) | Q parar, R giro 90°, F evasión, G giros guardados, Esc salir |
+
+- Usa el puerto COM10 (Bluetooth de la ESP32) por defecto; otro puerto con `--puerto COMx`.
+- Cierra Tera Term antes, porque el puerto solo lo puede usar un programa a la vez.
+- Si se cierra el programa o se corta la señal, el carro se detiene solo a los 0.3 s.
+- `--simular` prueba el control sin carro, mostrando lo que mandaría.
+
 ### Rutina de evasión
 
 1. Avanza recto manteniendo el rumbo.
@@ -105,6 +126,7 @@ Las constantes están al inicio de `main.c`. Las más usadas:
 | `TARGET_DISTANCE_M` | Distancia total de la rutina automática |
 | `US_THRESHOLD_CM` | Distancia a la que frena ante un obstáculo en la rutina automática (25 cm) |
 | `US_THRESHOLD_MANUAL_CM` | Distancia a la que se bloquea la `w` en manejo manual (12 cm) |
+| `JOY_PWM_MIN`, `JOY_PWM_MAX` | Rango de velocidad con el control de Xbox o el teclado de `control_carro.py` |
 | `EV_LATERAL_M`, `EV_PASAR_M`, `EV_REGRESO_M` | Longitud de los tramos del rodeo |
 | `EVASION_RODEO` | `1` = rodea y regresa a la línea; `0` = solo gira 90° y sigue |
 | `RECTO_KP` | Fuerza de la corrección de rumbo al avanzar |

@@ -77,6 +77,22 @@ volatile char uart_cmd_candidato[2] = {0, 0};
 volatile uint32_t uart_cmd_candidato_ms[2] = {0U, 0U};
 volatile uint32_t uart_rx_errores = 0U;
 volatile uint8_t uart_ultimo_dato[2] = {0U, 0U};   /* ultimo byte recibido por cada UART */
+/* Control proporcional (control de Xbox desde la compu, control_xbox.py).
+ * Mensaje: "#M<izq>,<der>\n" con cada rueda de -100 a 100 (% de velocidad,
+ * negativo = hacia atras). Si deja de llegar JOY_TIMEOUT_MS, se detiene. */
+#define JOY_TIMEOUT_MS         300U
+#define JOY_PWM_MIN            26.0f   /* PWM con el que la rueda empieza a moverse */
+#define JOY_PWM_MAX            45.0f   /* PWM con el stick/gatillo a fondo (max 49) */
+#define JOY_LINEA_MAX          16U
+volatile uint8_t joy_linea_activa[2] = {0U, 0U};
+volatile uint8_t joy_linea_len[2] = {0U, 0U};
+volatile char joy_linea[2][JOY_LINEA_MAX];
+volatile int8_t joy_rx_izq = 0;
+volatile int8_t joy_rx_der = 0;
+volatile uint8_t joy_rx_nuevo = 0U;
+volatile uint32_t joy_rx_ms = 0U;
+uint8_t joy_activo = 0U;               /* el carro se esta moviendo por el control */
+uint32_t joy_ultimo_ms = 0U;
 /* DIAGNOSTICO temporal: letras sueltas recibidas por la ESP32 (USART3). */
 volatile uint8_t rx_esp_diag[8];
 volatile uint8_t rx_esp_diag_head = 0U;
@@ -796,6 +812,25 @@ static void StopMotors(void)
     HAL_GPIO_WritePin(GPIOA, IN4_Pin, GPIO_PIN_RESET);
     HAL_GPIO_WritePin(GPIOA, LD2_Pin, GPIO_PIN_RESET);
 }
+/* Mueve cada rueda por separado: velocidad de -100 a 100 (negativo = atras).
+ * 0 = rueda parada; cualquier otro valor va de JOY_PWM_MIN a JOY_PWM_MAX. */
+static float PwmJoystick(int32_t v)
+{
+    int32_t a = (v < 0) ? -v : v;
+    if (a == 0) return 0.0f;
+    if (a > 100) a = 100;
+    return JOY_PWM_MIN + ((JOY_PWM_MAX - JOY_PWM_MIN) * (float)a / 100.0f);
+}
+static void SetMotoresConSigno(int32_t izq, int32_t der)
+{
+    /* Motor izquierdo: adelante IN1=0 IN2=1; atras IN1=1 IN2=0. */
+    HAL_GPIO_WritePin(GPIOA, In1_Pin, (izq < 0) ? GPIO_PIN_SET : GPIO_PIN_RESET);
+    HAL_GPIO_WritePin(IN2_GPIO_Port, IN2_Pin, (izq > 0) ? GPIO_PIN_SET : GPIO_PIN_RESET);
+    /* Motor derecho: adelante IN3=1 IN4=0; atras IN3=0 IN4=1. */
+    HAL_GPIO_WritePin(GPIOA, IN3_Pin, (der > 0) ? GPIO_PIN_SET : GPIO_PIN_RESET);
+    HAL_GPIO_WritePin(GPIOA, IN4_Pin, (der < 0) ? GPIO_PIN_SET : GPIO_PIN_RESET);
+    SetPWM(PwmJoystick(izq), PwmJoystick(der));
+}
 /* Angulo, velocidad y disponibilidad de la fuente elegida para los giros. */
 static float YawFuenteDeg(void)
 {
@@ -977,6 +1012,43 @@ static uint8_t EsLetraComando(uint8_t c)
  * CMD_GAP_MS anteriores ni posteriores (se permiten \r y \n despues).
  * Asi, las letras dentro de texto (p. ej. el eco de la telemetria cuando
  * la ESP32 esta apagada) nunca se interpretan como comandos. */
+/* Lee un entero con signo de la linea; avanza *pos. Regresa 0 si no hay numero. */
+static uint8_t LeerEnteroLinea(const volatile char *s, uint8_t len, uint8_t *pos, int32_t *valor)
+{
+    int32_t v = 0;
+    uint8_t negativo = 0U;
+    uint8_t digitos = 0U;
+    if ((*pos < len) && (s[*pos] == '-')) { negativo = 1U; (*pos)++; }
+    while ((*pos < len) && (s[*pos] >= '0') && (s[*pos] <= '9') && (digitos < 4U))
+    {
+        v = (v * 10) + (int32_t)(s[*pos] - '0');
+        (*pos)++;
+        digitos++;
+    }
+    *valor = (negativo != 0U) ? -v : v;
+    return digitos;
+}
+/* Interpreta "M<izq>,<der>" (sin el '#'). Se llama desde la interrupcion. */
+static void ProcesarLineaJoystick(uint8_t idx, uint32_t ahora)
+{
+    const volatile char *s = joy_linea[idx];
+    uint8_t len = joy_linea_len[idx];
+    uint8_t pos = 1U;
+    int32_t izq;
+    int32_t der;
+
+    if ((len < 4U) || (s[0] != 'M')) return;
+    if (LeerEnteroLinea(s, len, &pos, &izq) == 0U) return;
+    if ((pos >= len) || (s[pos] != ',')) return;
+    pos++;
+    if (LeerEnteroLinea(s, len, &pos, &der) == 0U) return;
+    if (pos != len) return;
+    if ((izq < -100) || (izq > 100) || (der < -100) || (der > 100)) return;
+    joy_rx_izq = (int8_t)izq;
+    joy_rx_der = (int8_t)der;
+    joy_rx_ms = ahora;
+    joy_rx_nuevo = 1U;
+}
 void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
 {
     uint8_t dato;
@@ -999,6 +1071,30 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
     }
 
     ahora = HAL_GetTick();
+    /* Linea del control proporcional "#M<izq>,<der>\n". Se arma aparte;
+     * sus bytes ademas cancelan cualquier letra candidata (no son comandos). */
+    if (dato == '#')
+    {
+        joy_linea_activa[idx] = 1U;
+        joy_linea_len[idx] = 0U;
+    }
+    else if (joy_linea_activa[idx] != 0U)
+    {
+        if ((dato == '\n') || (dato == '\r'))
+        {
+            joy_linea_activa[idx] = 0U;
+            ProcesarLineaJoystick(idx, ahora);
+        }
+        else if (joy_linea_len[idx] < (JOY_LINEA_MAX - 1U))
+        {
+            joy_linea[idx][joy_linea_len[idx]] = (char)dato;
+            joy_linea_len[idx]++;
+        }
+        else
+        {
+            joy_linea_activa[idx] = 0U;   /* demasiado larga: descartar */
+        }
+    }
     /* DIAGNOSTICO temporal: letras sueltas que llegan desde la ESP32. */
     if ((idx == 1U) && ((ahora - uart_ultimo_byte_ms[1]) >= CMD_GAP_MS) &&
         (dato >= 0x21U) && (dato <= 0x7EU))
@@ -1308,6 +1404,7 @@ int main(void)
                 "Especiales: F auto 2.5 m, R giro 90 derecha, I prueba lazo abierto 5 s\r\n"
                 "Boton azul: toque = giro R, mantener 1 s = modo F; en movimiento = STOP\r\n"
                 "G: ver los giros guardados en flash\r\n"
+                "Control de Xbox: programa control_xbox.py en la compu\r\n"
                 "Encoders y sensor ultrasonico activos\r\n\r\n";
         EnviarMensajeDebug(mensaje_inicio);
     }
@@ -2246,6 +2343,55 @@ int main(void)
                     EnviarMensajeDebug(msg);
                 }
             }
+        }
+        /* Control proporcional (Xbox): cada rueda con su velocidad y sentido. */
+        if (cmd != 0)
+        {
+            joy_activo = 0U;   /* cualquier comando de teclado/boton toma el control */
+        }
+        if (joy_rx_nuevo != 0U)
+        {
+            int32_t j_izq;
+            int32_t j_der;
+            __disable_irq();
+            j_izq = joy_rx_izq;
+            j_der = joy_rx_der;
+            joy_ultimo_ms = joy_rx_ms;
+            joy_rx_nuevo = 0U;
+            __enable_irq();
+            if ((j_izq == 0) && (j_der == 0))
+            {
+                if (joy_activo != 0U)
+                {
+                    StopMotors();
+                    joy_activo = 0U;
+                }
+            }
+            else
+            {
+                if (joy_activo == 0U)
+                {
+                    /* Tomar el control: cancelar evasion, giros, WASD, etc. */
+                    DetenerTodo();
+                    joy_activo = 1U;
+                    EnviarMensajeDebug("CONTROL: mando proporcional activo\r\n");
+                }
+                if ((obstaculo_manual != 0U) && ((j_izq + j_der) > 0))
+                {
+                    /* Algo muy cerca al frente: quitar la parte de avance y
+                     * dejar solo el giro (y la reversa). */
+                    int32_t avance = (j_izq + j_der) / 2;
+                    j_izq -= avance;
+                    j_der -= avance;
+                }
+                SetMotoresConSigno(j_izq, j_der);
+            }
+        }
+        if ((joy_activo != 0U) && ((HAL_GetTick() - joy_ultimo_ms) > JOY_TIMEOUT_MS))
+        {
+            StopMotors();
+            joy_activo = 0U;
+            EnviarMensajeDebug("CONTROL: sin senal del mando, PARADO\r\n");
         }
         /* Hombre muerto WASD: parar si se solto la tecla. */
         if (wasd_cmd != 0)
