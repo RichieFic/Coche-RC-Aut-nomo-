@@ -80,6 +80,7 @@ Después de soltar el botón, el LED parpadea 1.5 s antes de que el carro se mue
 | `R` | Giro de 90° a la derecha |
 | `I` | Prueba en lazo abierto durante 5 s |
 | `B` / `L` | Atrás / izquierda de forma continua, hasta recibir `S` |
+| `G` | Muestra los giros guardados en flash |
 
 ### Rutina de evasión
 
@@ -119,7 +120,8 @@ Por el monitor serie (115200 baud) el firmware reporta:
 
 - `IMU_VERTICAL` y `GIRO_FUENTE` al arrancar: qué eje quedó vertical y si los giros usan el giroscopio o los encoders.
 - `RESET:` la causa del último reinicio.
-- `GIROS_GUARDADOS`: los últimos giros guardados en flash, con su ángulo final y la velocidad al frenar.
+- `GIROS_GUARDADOS`: los últimos giros guardados en flash, con su ángulo final y la velocidad al frenar. Sale al arrancar y al mandar `G`.
+- Las líneas `DIAG:` y `RX_ESP:` están apagadas; se activan con `DIAG_ACTIVO` en `main.c`.
 - Telemetría continua de encoders, giroscopio y distancia al obstáculo.
 
 ## Pendientes

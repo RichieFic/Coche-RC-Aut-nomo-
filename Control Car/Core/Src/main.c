@@ -124,6 +124,7 @@ uint8_t giro_final_pendiente = 0U;     /* reportar angulo real tras frenar */
 uint32_t giro_final_ms = 0U;
 #define IMU_READ_INTERVAL_MS  20U
 #define TELEMETRIA_CON_OBSTACULO 1U   /* 1 = telemetria aunque haya obstaculo cerca */
+#define DIAG_ACTIVO           0U      /* 1 = lineas DIAG: y RX_ESP: (lectura extra del giroscopio) */
 /* Giroscopio Z (giros y evasion). El magnetometro queda para rumbo absoluto. */
 #define GYRO_Z_SIGNO          1.0f    /* signo de la velocidad proyectada; cambiar a -1.0f si al girar a la derecha YAW_G sube */
 #define GYRO_BIAS_MS          1500U   /* medicion del sesgo con el carro quieto */
@@ -494,7 +495,12 @@ static void ReportarGPS(void)
 
     if (gps->bytes_received == 0U)
     {
-        EnviarMensajeDebug("GPS: SIN_DATOS (revisar TX del GPS -> PD2, VCC y GND)\r\n");
+        static uint8_t avisos_sin_datos = 0U;
+        if ((avisos_sin_datos % 10U) == 0U)
+        {
+            EnviarMensajeDebug("GPS: SIN_DATOS (revisar TX del GPS -> PD2, VCC y GND)\r\n");
+        }
+        avisos_sin_datos++;
         return;
     }
     if (gps->sentences_ok == 0U)
@@ -755,6 +761,21 @@ static void IniciarGiroEvasion(int8_t dir)
     else SetTurnLeftDirection();
     SetPWM(GIRO_PWM_MAX, GIRO_PWM_MAX);
 }
+/* Detiene los motores y limpia TODO el estado de movimiento (giro, evasion,
+ * modo automatico, WASD y cuenta regresiva del boton). */
+static void DetenerTodo(void)
+{
+    StopMotors();
+    yaw_turn_active = 0U;
+    estado_giro = 0U;
+    modo_automatico = 0U;
+    modo_lazo_abierto = 0U;
+    prueba_identificacion = 0U;
+    wasd_cmd = 0;
+    evasion_fase = EV_NINGUNA;
+    giro_subfase = GIRO_SUB_GIRANDO;
+    boton_armado = 0U;
+}
 /* Inicia un tramo recto del rodeo (LATERAL, PASAR o REGRESO). */
 static void IniciarTramoEvasion(uint8_t fase)
 {
@@ -798,6 +819,7 @@ static uint8_t EsLetraComando(uint8_t c)
         case 'w': case 'W': case 'a': case 'A':
         case 's': case 'd': case 'D':
         case 'B': case 'L':          /* compatibilidad con la app/ESP32 */
+        case 'G': case 'g':          /* imprimir GIROS_GUARDADOS */
             return 1U;
         default:
             return 0U;
@@ -1124,6 +1146,7 @@ int main(void)
                 "Bluetooth/app: B atras, L izquierda (hasta S)\r\n"
                 "Especiales: F auto 2.5 m, R giro 90 derecha, I prueba lazo abierto 5 s\r\n"
                 "Boton azul: toque = giro R, mantener 1 s = modo F; en movimiento = STOP\r\n"
+                "G: ver los giros guardados en flash\r\n"
                 "Encoders y sensor ultrasonico activos\r\n\r\n";
         EnviarMensajeDebug(mensaje_inicio);
     }
@@ -1135,7 +1158,6 @@ int main(void)
         {
             last_gps_report_time = HAL_GetTick();
             ReportarGPS();
-            LogImprimir();
         }
         /* Boton azul:
          *  - carro en movimiento: presionar = STOP inmediato.
@@ -1280,7 +1302,8 @@ int main(void)
                     gyro_desbordes++;
                 }
                 /* DIAGNOSTICO: lectura directa e integracion de Z sin FIFO. */
-                if (MPU9250_GyroReadDirect(&hi2c1, diag_gyro_dps, &diag_fifo_bytes) == HAL_OK)
+                if ((DIAG_ACTIVO != 0U) &&
+                    (MPU9250_GyroReadDirect(&hi2c1, diag_gyro_dps, &diag_fifo_bytes) == HAL_OK))
                 {
                     float dt_d = (float)(now_gyro - diag_last_ms) / 1000.0f;
                     if (dt_d > 0.1f) dt_d = 0.1f;
@@ -1312,6 +1335,7 @@ int main(void)
                     StopMotors();
                     giro_subfase = GIRO_SUB_ASENTANDO;
                     giro_subfase_ms = HAL_GetTick();
+                    yaw_turn_start_ms = giro_subfase_ms;   /* tiempo limite propio para asentar/corregir */
                 }
                 else if (yaw_turn_progress_deg < -YAW_TURN_WRONG_LIMIT_DEG)
                 {
@@ -1455,9 +1479,11 @@ int main(void)
                 }
                 else
                 {
-                    /* Fin de la evasion: seguir avanzando con el rumbo actual. */
+                    /* Fin de la evasion: seguir avanzando con el rumbo actual.
+                     * El obstaculo ya quedo atras: permitir una evasion nueva. */
                     evasion_fase = EV_NINGUNA;
                     estado_giro = 0U;
+                    obstacle_latched = 0U;
                     SetForwardDirection();
                     SetPWM(PWM_MANUAL, PWM_MANUAL);
                     EnviarMensajeDebug("EVASION: terminada; continuo avanzando\r\n");
@@ -1677,8 +1703,8 @@ int main(void)
                         (unsigned long)tiempo_comando_ms);
                 }
                 EnviarMensajeDebug(mensaje);
-                /* DIAGNOSTICO temporal del giroscopio (lectura directa, sin FIFO). */
-                if (gyro_ok != 0U)
+                /* DIAGNOSTICO del giroscopio (lectura directa, sin FIFO). */
+                if ((DIAG_ACTIVO != 0U) && (gyro_ok != 0U))
                 {
                     char diag[140];
                     int gx = (int)(diag_gyro_dps[0] * 10.0f);
@@ -1811,8 +1837,11 @@ int main(void)
             char rx_msg[40];
             uint8_t c = rx_esp_diag[rx_esp_diag_tail];
             rx_esp_diag_tail = (uint8_t)((rx_esp_diag_tail + 1U) % 8U);
-            snprintf(rx_msg, sizeof(rx_msg), "RX_ESP: '%c' (0x%02X)\r\n", (char)c, (unsigned int)c);
-            EnviarMensajeDebug(rx_msg);
+            if (DIAG_ACTIVO != 0U)
+            {
+                snprintf(rx_msg, sizeof(rx_msg), "RX_ESP: '%c' (0x%02X)\r\n", (char)c, (unsigned int)c);
+                EnviarMensajeDebug(rx_msg);
+            }
         }
         /* Revisar si llego un comando (Tera Term o Bluetooth) */
         uint32_t momento_cmd = 0U;
@@ -1843,6 +1872,11 @@ int main(void)
         }
         /* Normalizar: q/Q = parar; W/A/D mayuscula = w/a/d.
          * Ojo: 's' minuscula = atras, 'S' mayuscula = parar. */
+        if ((cmd == 'G') || (cmd == 'g'))
+        {
+            LogImprimir();     /* no cambia el estado del carro */
+            cmd = 0;
+        }
         if ((cmd == 'q') || (cmd == 'Q')) cmd = 'S';
         else if (cmd == 'W') cmd = 'w';
         else if (cmd == 'A') cmd = 'a';
@@ -2024,12 +2058,7 @@ int main(void)
             }
             else if (cmd == 'S')
             {
-                yaw_turn_active = 0U;
-                estado_giro = 0U;
-                StopMotors();
-                modo_lazo_abierto = 0U;
-                modo_automatico = 0U;
-                prueba_identificacion = 0U;
+                DetenerTodo();
                 {
                     const char *msg = "COMANDO: STOP - fin de prueba\r\n";
                     EnviarMensajeDebug(msg);
