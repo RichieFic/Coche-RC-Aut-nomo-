@@ -1,0 +1,2266 @@
+/*
+ * Programa del carro
+ * Control por Bluetooth, lectura de encoders y sensor ultrasonico.
+ * Modo manual y recorrido automatico de 1 m en lazo abierto con PWM fijo=39.
+ *
+ * Encoders: TIM3 derecho y TIM4 izquierdo
+ * PWM: TIM5 canal 1 (izquierdo) y canal 2 (derecho)
+ * HC-SR04: TRIG PB0, ECHO PB1
+ */
+#include "main.h"
+#include <string.h>
+#include <stdlib.h>
+#include <stdio.h>
+#include <math.h>
+#include "MPU9250.h"
+#include "gps_neo6m.h"
+/* Valores que se usan en el programa */
+#define ENCODER_COUNTS_PER_REV       1971.4f
+#define PI_VALUE                     3.14159265f
+#define WHEEL_DIAMETER_M             0.068f
+#define TRACK_WIDTH_M                 0.172f   /* medido en CAD (centro a centro) */
+#define TURN_DISTANCE_M               (PI_VALUE * TRACK_WIDTH_M / 4.0f)
+#define LATERAL_DISTANCE_M            0.10f
+/* Tiempo entre mediciones */
+#define RPM_SAMPLE_TIME_MS           100U
+/* PWM fijo para los motores */
+#define PWM_MAX_VALUE                49.0f
+#define PWM_MANUAL                   39.0f
+#define ID_PWM_STEP                  39.0f
+#define ID_TEST_DURATION_MS          5000U
+/* Control automatico: valores iniciales para validar en el carro */
+#define TARGET_DISTANCE_M            2.50f
+#define BRAKE_DISTANCE_M             0.15f
+/* Pines del sensor ultrasonico. ECHO necesita divisor de voltaje. */
+#define US_TRIG_GPIO_Port             GPIOB
+#define US_TRIG_Pin                   GPIO_PIN_0
+#define US_ECHO_GPIO_Port             GPIOB
+#define US_ECHO_Pin                   GPIO_PIN_1
+#define US_THRESHOLD_CM               25.0f   /* frenar con margen (antes 15) */
+#define US_SAMPLE_TIME_MS             60U     /* medir mas seguido (antes 150) */
+#define US_TIMEOUT_US                 25000U
+/* Variables globales */
+TIM_HandleTypeDef htim3;
+TIM_HandleTypeDef htim4;
+TIM_HandleTypeDef htim5;
+UART_HandleTypeDef huart2;
+UART_HandleTypeDef huart3;
+I2C_HandleTypeDef hi2c1;
+/* Datos que llegan por Bluetooth */
+uint8_t rxDatoUSART2 = 0U; /* Recepcion Tera Term */
+uint8_t rxDatoUSART3 = 0U; /* Recepcion ESP32 */
+/* Comandos de una letra "aislada" por UART (indice 0 = USART2, 1 = USART3). */
+#define CMD_GAP_MS                   10U
+volatile uint32_t uart_ultimo_byte_ms[2] = {0U, 0U};
+volatile char uart_cmd_candidato[2] = {0, 0};
+volatile uint32_t uart_cmd_candidato_ms[2] = {0U, 0U};
+volatile uint32_t uart_rx_errores = 0U;
+/* DIAGNOSTICO temporal: letras sueltas recibidas por la ESP32 (USART3). */
+volatile uint8_t rx_esp_diag[8];
+volatile uint8_t rx_esp_diag_head = 0U;
+volatile uint8_t rx_esp_diag_tail = 0U;
+/* Control WASD "mantener presionado": se detiene al soltar la tecla. */
+#define WASD_TIMEOUT_INICIAL_MS      600U  /* cubre el retardo de autorrepeticion */
+#define WASD_TIMEOUT_REPETICION_MS   150U  /* una vez que la tecla ya repite */
+char wasd_cmd = 0;                         /* 0, 'w', 's', 'a' o 'd' */
+uint32_t wasd_ultimo_ms = 0U;
+uint8_t wasd_repite = 0U;
+uint32_t wasd_aviso_obstaculo_ms = 0U;
+/* Variables de los encoders */
+uint16_t encoder3_previous = 0;
+int16_t encoder3_delta = 0;
+float rpm_motor_derecho = 0.0f;
+float wheel_speed_derecho_ms = 0.0f;
+uint16_t encoder4_previous = 0;
+int16_t encoder4_delta = 0;
+float rpm_motor_izquierdo = 0.0f;
+float wheel_speed_izquierdo_ms = 0.0f;
+float pwm_actual_izquierdo = 0.0f;
+float pwm_actual_derecho = 0.0f;
+float distance_per_count = 0.0f;
+float encoder_distance_m = 0.0f;       /* Distancia acumulada desde el encendido */
+float encoder_speed_m_s = 0.0f;        /* Rapidez promedio de ambas ruedas */
+uint32_t last_rpm_time = 0U;
+/* Datos para identificar la respuesta del motor desde el arranque */
+volatile uint8_t prueba_identificacion = 0U;
+uint32_t tiempo_inicio_prueba = 0U;
+/* Prueba de identificacion en lazo abierto, comando Bluetooth I. */
+uint8_t modo_lazo_abierto = 0U;
+uint32_t tiempo_inicio_lazo_abierto = 0U;
+/* Referencia de tiempo: se reinicia cada vez que se recibe F, B, L, R, S o I. */
+uint32_t tiempo_inicio_comando = 0U;
+/* T_MS permanece en cero hasta recibir el primer comando valido. */
+uint8_t tiempo_comando_activo = 0U;
+/* Control automatico de distancia */
+volatile uint8_t modo_automatico = 0U;
+float distancia_inicio_m = 0.0f;
+uint8_t parada_por_obstaculo = 0U;
+uint8_t obstacle_latched = 0U; /* evita reactivar el mismo obstaculo mientras sigue enfrente */
+uint8_t estado_giro = 0U;
+float distancia_giro_m = 0.0f;
+/* MPU-9250 / magnetometro AK8963 */
+MPU9250_Data_t imuData;
+uint8_t imuStatus = 0U;
+uint32_t last_imu_read_time = 0U;
+/* El rumbo se toma como cero en la orientacion fisica del encendido. */
+float imu_heading_zero_deg = 0.0f;
+float imu_heading_relative_deg = 0.0f;
+uint8_t imu_zero_valid = 0U;
+uint8_t imu_mag_valid = 0U;
+MPU9250_Diagnostics_t imuDiag;
+uint32_t last_imu_error_report = 0U;
+uint16_t imu_zero_samples = 0U;
+float imu_zero_sin_sum = 0.0f;
+float imu_zero_cos_sum = 0.0f;
+/* Estado del giro derecho cerrado por YAW_REL. */
+volatile uint8_t yaw_turn_active = 0U;
+int8_t yaw_turn_direction = 1; /* +1 derecha (-90 YAW), -1 izquierda (+90 YAW) */
+uint8_t next_evasion_right = 1U; /* alterna en cada obstaculo */
+float yaw_turn_progress_deg = 0.0f;
+uint32_t yaw_turn_start_ms = 0U;
+uint32_t yaw_turn_last_valid_ms = 0U;
+float yaw_turn_inicio_deg = 0.0f;      /* yaw_gyro_deg al iniciar el giro */
+uint8_t giro_final_pendiente = 0U;     /* reportar angulo real tras frenar */
+uint32_t giro_final_ms = 0U;
+#define IMU_READ_INTERVAL_MS  20U
+#define TELEMETRIA_CON_OBSTACULO 1U   /* 1 = telemetria aunque haya obstaculo cerca */
+/* Giroscopio Z (giros y evasion). El magnetometro queda para rumbo absoluto. */
+#define GYRO_Z_SIGNO          1.0f    /* signo de la velocidad proyectada; cambiar a -1.0f si al girar a la derecha YAW_G sube */
+#define GYRO_BIAS_MS          1500U   /* medicion del sesgo con el carro quieto */
+#define GYRO_ZUPT_ALFA        0.01f   /* ajuste lento del sesgo con las ruedas paradas */
+#define GYRO_ZUPT_MAX_DPS     3.0f    /* solo se ajusta si gira menos que esto */
+#define GYRO_ZUPT_QUIETO_MS   1000U   /* tiempo con encoders en 0 para ajustar */
+#define GIRO_ANTICIPO_S       0.08f   /* frenar antes segun la velocidad (inercia) */
+#define GIRO_FINAL_ESPERA_MS  150U    /* ya se asento y corrigio; solo confirmar */
+/* Fuente para medir los giros de R y de la evasion. Se elige al arrancar:
+ * giroscopio si la IMU esta de canto (eje X/Y vertical) y midio bien el sesgo;
+ * si no, encoders. GIRO_FUENTE_PREFERIDA = ENC fuerza siempre encoders. */
+#define GIRO_FUENTE_GYRO      0U
+#define GIRO_FUENTE_ENC       1U
+#define GIRO_FUENTE_PREFERIDA GIRO_FUENTE_GYRO
+/* El eje Z del giroscopio de este modulo esta danado: no se usa (0).
+ * Con un modulo sano montado plano, poner 1. */
+#define GYRO_USAR_Z           0U
+uint8_t giro_fuente = GIRO_FUENTE_ENC;
+float imu_up[3] = {0.0f, 0.0f, 0.0f};  /* vertical medida por el acelerometro */
+/* Angulo por encoders: (der - izq) * m_por_cuenta / ancho_entre_ruedas.
+ * Ajustar ENC_GIRO_ESCALA con pruebas: si el carro gira MENOS de 90 reales,
+ * bajarla (p. ej. 0.9); si gira MAS, subirla. */
+#define ENC_GIRO_ESCALA       1.0f
+float yaw_enc_deg = 0.0f;              /* acumulado por encoders: izquierda +, derecha - */
+float yaw_enc_rate_dps = 0.0f;
+uint16_t enc_yaw_prev3 = 0U;
+uint16_t enc_yaw_prev4 = 0U;
+float enc_rate_ref_deg = 0.0f;
+uint32_t enc_rate_ref_ms = 0U;
+uint8_t gyro_ok = 0U;
+float gyro_bias_dps = 0.0f;
+float yaw_gyro_deg = 0.0f;             /* acumulado: izquierda +, derecha - */
+float gyro_rate_dps = 0.0f;            /* velocidad Z con signo de montaje */
+uint32_t gyro_last_ok_ms = 0U;
+uint32_t gyro_quieto_desde_ms = 0U;
+uint32_t gyro_desbordes = 0U;
+uint32_t last_gyro_read_ms = 0U;
+/* DIAGNOSTICO temporal: giroscopio leido directo de registros (sin FIFO). */
+float diag_gyro_dps[3] = {0.0f, 0.0f, 0.0f};
+uint16_t diag_fifo_bytes = 0U;
+float diag_bias_z_dps = 0.0f;
+float diag_yaw_d_deg = 0.0f;
+uint32_t diag_last_ms = 0U;
+/* Giro de 90 grados medido con el giroscopio. */
+#define YAW_TURN_TARGET_DEG       90.0f
+#define YAW_TURN_TIMEOUT_MS     8000U
+#define YAW_TURN_WRONG_LIMIT_DEG  10.0f
+#define YAW_TURN_VALID_TIMEOUT_MS 250U
+/* GPS NEO-6M en UART5 (TX del GPS -> PD2). Reporte una vez por segundo. */
+#define GPS_REPORT_INTERVAL_MS  1000U
+#define GPS_FIX_MAX_AGE_MS      2000U
+uint32_t last_gps_report_time = 0U;
+/* Boton azul B1 (PC13, activo en bajo): lanza un giro R sin Bluetooth/cable.
+ * Cuenta regresiva con LD2 parpadeando para retirar la mano. */
+#define BOTON_ESPERA_MS        1500U
+#define BOTON_ANTIRREBOTE_MS   50U
+uint8_t boton_estado_prev = 1U;        /* 1 = suelto */
+uint32_t boton_cambio_ms = 0U;
+uint8_t boton_armado = 0U;             /* cuenta regresiva en curso */
+uint32_t boton_armado_ms = 0U;
+#define BOTON_LARGO_MS         1000U   /* mantener >= 1 s = modo F */
+uint32_t boton_presion_ms = 0U;
+uint8_t boton_ignorar_soltar = 0U;     /* la presion fue un STOP */
+char boton_cmd = 0;                    /* 'R' o 'F' al terminar la cuenta */
+char boton_cmd_inmediato = 0;          /* 'S' de emergencia */
+/* Ultimos GIRO_FINAL guardados para leerlos despues por USB. */
+#define ULT_GIROS_N            5U
+float ult_giros_deg[ULT_GIROS_N];
+uint8_t ult_giros_cuenta = 0U;         /* total registrados (satura en 255) */
+uint8_t giros_fallidos = 0U;           /* ERROR / ABORT / TIMEOUT */
+float giro_vel_al_frenar = 0.0f;       /* dps al mandar parar (para ajustar el anticipo) */
+/* Modo F: rumbo absoluto. Al iniciar F se guarda el rumbo de salida y cada
+ * evasion apunta a un rumbo exacto (+-90 del objetivo anterior), asi el error
+ * de un giro se corrige en el siguiente y no se acumula. */
+float rumbo_objetivo_deg = 0.0f;       /* mismo marco que YawFuenteDeg(): izq +, der - */
+uint8_t rumbo_valido = 0U;
+/* Mantener recto al avanzar en modo F (solo con giroscopio):
+ * pwm_izq = base + corr, pwm_der = base - corr, corr = KP*err + KD*vel,
+ * err = rumbo actual - objetivo (+ = se desvio a la izquierda).
+ * RECTO_ACTIVO = 0 lo desactiva. Si corrige al reves (se va mas chueco),
+ * cambiar RECTO_SIGNO a -1. */
+#define RECTO_ACTIVO           1U
+#define RECTO_SIGNO            1.0f
+#define RECTO_KP               2.0f    /* PWM por grado de error */
+#define RECTO_KD               0.03f   /* PWM por dps */
+#define RECTO_MAX              6.0f    /* correccion maxima (PWM) */
+/* ---- Control fino de los giros de 90 (R, boton y evasion) ----
+ * 1) Perfil: PWM = GIRO_PWM_MIN + GIRO_KP * (grados restantes), entre MIN y MAX;
+ *    baja la velocidad al acercarse al objetivo. Antiatasco: si gira a menos
+ *    de GIRO_VEL_MIN_DPS, sube el PWM poco a poco (hasta GIRO_BOOST_MAX).
+ * 2) Asentar y corregir: tras frenar espera GIRO_ASENTAR_MS; si el error es
+ *    mayor a GIRO_TOL_DEG da toques cortos a GIRO_CORR_PWM (max GIRO_CORR_MAX).
+ * 3) Pivote centrado: iguala el avance de las dos ruedas con los encoders
+ *    (GIRO_EQUILIBRAR_ENC = 0 lo apaga). */
+#define GIRO_PWM_MAX           39.0f
+#define GIRO_PWM_MIN           31.0f
+#define GIRO_KP                0.30f   /* PWM por grado restante */
+#define GIRO_VEL_MIN_DPS       15.0f
+#define GIRO_ATASCO_MS         250U
+#define GIRO_BOOST_PASO        1.0f    /* PWM extra cada 100 ms atascado */
+#define GIRO_BOOST_MAX         10.0f
+#define GIRO_ASENTAR_MS        300U
+#define GIRO_TOL_DEG           2.0f
+#define GIRO_CORR_PWM          34.0f
+#define GIRO_CORR_MAX_MS       600U
+#define GIRO_CORR_MAX          2U
+#define GIRO_EQUILIBRAR_ENC    1U
+#define GIRO_ENC_KP            0.05f   /* PWM por cuenta de diferencia */
+#define GIRO_ENC_MAX           6.0f
+#define GIRO_SUB_GIRANDO       0U
+#define GIRO_SUB_ASENTANDO     1U
+#define GIRO_SUB_CORRIGIENDO   2U
+uint8_t giro_subfase = GIRO_SUB_GIRANDO;
+uint32_t giro_subfase_ms = 0U;
+uint8_t giro_correcciones = 0U;
+float giro_boost = 0.0f;
+uint32_t giro_lento_desde_ms = 0U;
+uint32_t giro_boost_ms = 0U;
+uint16_t giro_enc_ini3 = 0U;           /* TIM3 = rueda derecha */
+uint16_t giro_enc_ini4 = 0U;           /* TIM4 = rueda izquierda */
+uint8_t giro_enc_valido = 1U;
+float giro_corr_err_ini = 0.0f;
+/* Rodeo del obstaculo en modo F (lado s = derecha la 1a vez, luego alterna):
+ *  1 RETRO   : retrocede EV_RETRO_MS
+ *  2 GIRO1   : gira 90 hacia el lado s
+ *  3 LATERAL : avanza EV_LATERAL_M (se aparta de la linea)
+ *  4 GIRO2   : gira 90 de regreso al rumbo original
+ *  5 PASAR   : avanza EV_PASAR_M (pasa junto al obstaculo)
+ *  6 GIRO3   : gira 90 hacia la linea original
+ *  7 REGRESO : avanza EV_REGRESO_M (vuelve a la linea)
+ *  8 GIRO4   : gira 90 al rumbo original y sigue avanzando
+ * Si ve otro obstaculo en un tramo recto del rodeo, se detiene. */
+#define EV_NINGUNA             0U
+#define EV_RETRO               1U
+#define EV_GIRO1               2U
+#define EV_LATERAL             3U
+#define EV_GIRO2               4U
+#define EV_PASAR               5U
+#define EV_GIRO3               6U
+#define EV_REGRESO             7U
+#define EV_GIRO4               8U
+#define EV_FRENO               9U      /* parado un momento antes de la reversa */
+#define EV_PAUSA               10U     /* parado un momento antes de girar */
+/* 0 = secuencia original: frena, retrocede, gira 90 y sigue en la nueva
+ *     direccion (la siguiente evasion gira al otro lado).
+ * 1 = rodeo completo de 8 pasos (vuelve a la linea original). */
+#define EVASION_RODEO          1U
+#define EV_FRENO_MS            400U    /* parado tras detectar el obstaculo */
+#define EV_RETRO_PWM           32.0f   /* reversa lenta (PWM_MANUAL = 39, max 49) */
+#define EV_RETRO_MS            900U    /* tiempo de reversa */
+#define EV_PAUSA_MS            300U    /* parado antes de girar */
+#define EV_LATERAL_M           0.65f   /* cuanto se aparta de la linea */
+#define EV_REGRESO_M           0.65f   /* cuanto regresa hacia la linea (ajustar aparte: el carro no gira sobre su eje) */
+#define EV_PASAR_M             0.80f   /* cuanto avanza junto al obstaculo */
+#define EV_TRAMO_MAX_MS        6000U   /* limite por tramo si los encoders fallan */
+#define EV_UMBRAL_RODEO_CM     12.0f   /* en los tramos del rodeo solo frena si algo esta MUY cerca
+                                        * (la esquina de la caja puede verse de lado) */
+uint8_t evasion_fase = EV_NINGUNA;
+int8_t evasion_lado = 1;               /* +1 derecha, -1 izquierda */
+uint32_t evasion_fase_ms = 0U;
+float evasion_seg_m = 0.0f;            /* distancia del tramo actual */
+uint8_t evasion_sig_fase = EV_NINGUNA; /* fase que sigue a la pausa */
+int8_t evasion_sig_dir = 1;            /* sentido del giro que sigue a la pausa */
+/* Registro de giros en FLASH (sector 7, 0x08060000-0x0807FFFF, no lo usa el
+ * programa): sobrevive a reinicios y apagados. Cada registro = 2 palabras:
+ *   w0 = 0x47 | tipo | velocidad al frenar (dps), w1 = angulo (float). */
+#define LOG_FLASH_INICIO       0x08060000UL
+#define LOG_FLASH_FIN          0x08080000UL
+#define LOG_TIPO_OK            1U
+#define LOG_TIPO_FALLO         2U
+#define LOG_TIPO_ARRANQUE      3U
+#define LOG_MOSTRAR            10U
+uint32_t log_siguiente = 0U;           /* siguiente direccion libre (0 = sin registro) */
+uint32_t causa_reset = 0U;             /* copia de RCC->CSR al arrancar */
+/* Funciones que se usan mas adelante */
+/* I2C1 para MPU-9250: PB8=SCL, PB9=SDA, 100 kHz.
+ * Se configura GPIO aqui para no duplicar HAL_I2C_MspInit en el proyecto.
+ * Verifica que stm32f4xx_hal_msp.c no reasigne PB8/PB9 a otro periferico.
+ */
+static void MX_I2C1_Init(void)
+{
+    GPIO_InitTypeDef GPIO_InitStruct = {0};
+    __HAL_RCC_GPIOB_CLK_ENABLE();
+    __HAL_RCC_I2C1_CLK_ENABLE();
+    GPIO_InitStruct.Pin = GPIO_PIN_8 | GPIO_PIN_9;
+    GPIO_InitStruct.Mode = GPIO_MODE_AF_OD;
+    GPIO_InitStruct.Pull = GPIO_PULLUP;
+    GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_VERY_HIGH;
+    GPIO_InitStruct.Alternate = GPIO_AF4_I2C1;
+    HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
+    hi2c1.Instance = I2C1;
+    hi2c1.Init.ClockSpeed = 100000;
+    hi2c1.Init.DutyCycle = I2C_DUTYCYCLE_2;
+    hi2c1.Init.OwnAddress1 = 0;
+    hi2c1.Init.AddressingMode = I2C_ADDRESSINGMODE_7BIT;
+    hi2c1.Init.DualAddressMode = I2C_DUALADDRESS_DISABLE;
+    hi2c1.Init.OwnAddress2 = 0;
+    hi2c1.Init.GeneralCallMode = I2C_GENERALCALL_DISABLE;
+    hi2c1.Init.NoStretchMode = I2C_NOSTRETCH_DISABLE;
+    if (HAL_I2C_Init(&hi2c1) != HAL_OK)
+    {
+        Error_Handler();
+    }
+}
+void SystemClock_Config(void);
+static void MX_GPIO_Init(void);
+static void MX_USART2_UART_Init(void);
+static void MX_USART3_UART_Init(void);
+static void MX_TIM3_Init(void);
+static void MX_TIM4_Init(void);
+static void MX_TIM5_Init(void);
+static void MX_I2C1_Init(void);
+static void SetPWM(float pwm_left, float pwm_right);
+static void SetForwardDirection(void);
+static void SetBackwardDirection(void);
+static void SetTurnLeftDirection(void);
+static void SetTurnRightDirection(void);
+static void StopMotors(void);
+static void EnviarMensajeDebug(const char *mensaje);
+static void DWT_Delay_Init(void);
+static void DWT_Delay_us(uint32_t us);
+static float Ultrasonic_ReadCm(void);
+static void ReportarGPS(void);
+/* USER CODE BEGIN 0 ------------------------------------------------------- */
+/* Escribe grados*1e7 como texto con signo, p. ej. "+19.4326077". */
+static void FormatearGrados(char *buf, size_t len, int32_t valor_e7)
+{
+    char signo = (valor_e7 < 0) ? '-' : '+';
+    uint32_t abs_e7 = (valor_e7 < 0) ? (uint32_t)(-(int64_t)valor_e7) : (uint32_t)valor_e7;
+    snprintf(buf, len, "%c%lu.%07lu", signo,
+             (unsigned long)(abs_e7 / 10000000UL),
+             (unsigned long)(abs_e7 % 10000000UL));
+}
+/* ---------------- Registro de giros en FLASH ---------------- */
+static uint32_t LogLeer(uint32_t dir)
+{
+    return *(volatile const uint32_t *)dir;
+}
+/* Borra el sector 7 (tarda ~1-2 s; solo se llama al arrancar). */
+static uint8_t LogBorrar(void)
+{
+    FLASH_EraseInitTypeDef borrado;
+    uint32_t error_sector = 0U;
+    HAL_StatusTypeDef st;
+
+    borrado.TypeErase = FLASH_TYPEERASE_SECTORS;
+    borrado.Sector = FLASH_SECTOR_7;
+    borrado.NbSectors = 1U;
+    borrado.VoltageRange = FLASH_VOLTAGE_RANGE_3;
+    HAL_FLASH_Unlock();
+    __HAL_FLASH_CLEAR_FLAG(FLASH_FLAG_EOP | FLASH_FLAG_OPERR | FLASH_FLAG_WRPERR |
+                           FLASH_FLAG_PGAERR | FLASH_FLAG_PGPERR | FLASH_FLAG_PGSERR);
+    st = HAL_FLASHEx_Erase(&borrado, &error_sector);
+    HAL_FLASH_Lock();
+    return (st == HAL_OK) ? 1U : 0U;
+}
+/* Busca el primer hueco libre. Si el sector esta lleno o tiene datos ajenos,
+ * lo borra. Deja log_siguiente = 0 si algo falla. */
+static void LogIniciar(void)
+{
+    uint32_t dir;
+    log_siguiente = 0U;
+    for (dir = LOG_FLASH_INICIO; dir < LOG_FLASH_FIN; dir += 8U)
+    {
+        uint32_t w0 = LogLeer(dir);
+        if (w0 == 0xFFFFFFFFUL)
+        {
+            log_siguiente = dir;
+            return;
+        }
+        if ((w0 >> 24) != 0x47UL) break;   /* datos que no son del registro */
+    }
+    EnviarMensajeDebug("LOG: borrando registro de giros en flash...\r\n");
+    if (LogBorrar() != 0U) log_siguiente = LOG_FLASH_INICIO;
+}
+static void LogEscribir(uint8_t tipo, float valor, float vel_dps)
+{
+    union { float f; uint32_t u; } conv;
+    uint32_t vel = (uint32_t)(fabsf(vel_dps) + 0.5f);
+    uint32_t w0;
+
+    if ((log_siguiente == 0U) || ((log_siguiente + 8U) > LOG_FLASH_FIN)) return;
+    if (vel > 0xFFFFUL) vel = 0xFFFFUL;
+    w0 = 0x47000000UL | ((uint32_t)tipo << 16) | vel;
+    conv.f = valor;
+    HAL_FLASH_Unlock();
+    __HAL_FLASH_CLEAR_FLAG(FLASH_FLAG_EOP | FLASH_FLAG_OPERR | FLASH_FLAG_WRPERR |
+                           FLASH_FLAG_PGAERR | FLASH_FLAG_PGPERR | FLASH_FLAG_PGSERR);
+    if (HAL_FLASH_Program(FLASH_TYPEPROGRAM_WORD, log_siguiente, w0) == HAL_OK)
+    {
+        (void)HAL_FLASH_Program(FLASH_TYPEPROGRAM_WORD, log_siguiente + 4U, conv.u);
+    }
+    HAL_FLASH_Lock();
+    log_siguiente += 8U;
+}
+/* Imprime los ultimos LOG_MOSTRAR registros, del mas viejo al mas nuevo.
+ * "|" = arranque, "91.2@150" = giro final 91.2 deg frenando a 150 dps,
+ * "X45.0" = giro fallido (progreso 45.0 deg). */
+static void LogImprimir(void)
+{
+    char linea[220];
+    int pos;
+    uint32_t inicio;
+    uint32_t dir;
+    uint32_t total;
+
+    if (log_siguiente == 0U)
+    {
+        EnviarMensajeDebug("GIROS_GUARDADOS: registro en flash no disponible\r\n");
+        return;
+    }
+    total = (log_siguiente - LOG_FLASH_INICIO) / 8U;
+    inicio = (total > LOG_MOSTRAR) ? (log_siguiente - (LOG_MOSTRAR * 8U)) : LOG_FLASH_INICIO;
+    pos = snprintf(linea, sizeof(linea), "GIROS_GUARDADOS (| = arranque, angulo@dps):");
+    for (dir = inicio; (dir < log_siguiente) && (pos > 0) && (pos < ((int)sizeof(linea) - 20)); dir += 8U)
+    {
+        union { float f; uint32_t u; } conv;
+        uint32_t w0 = LogLeer(dir);
+        uint8_t tipo = (uint8_t)((w0 >> 16) & 0xFFU);
+        int v;
+        conv.u = LogLeer(dir + 4U);
+        v = (int)(conv.f * 10.0f);
+        if (tipo == LOG_TIPO_ARRANQUE)
+        {
+            pos += snprintf(&linea[pos], sizeof(linea) - (size_t)pos, " |");
+        }
+        else if (tipo == LOG_TIPO_OK)
+        {
+            pos += snprintf(&linea[pos], sizeof(linea) - (size_t)pos, " %s%d.%d@%lu",
+                            (v < 0) ? "-" : "", abs(v) / 10, abs(v) % 10,
+                            (unsigned long)(w0 & 0xFFFFUL));
+        }
+        else
+        {
+            pos += snprintf(&linea[pos], sizeof(linea) - (size_t)pos, " X%s%d.%d",
+                            (v < 0) ? "-" : "", abs(v) / 10, abs(v) % 10);
+        }
+    }
+    if ((pos > 0) && (pos < (int)sizeof(linea)))
+    {
+        snprintf(&linea[pos], sizeof(linea) - (size_t)pos, "\r\n");
+    }
+    EnviarMensajeDebug(linea);
+}
+/* Causa del ultimo reinicio (RCC->CSR leido al inicio de main). */
+static void ReportarCausaReset(void)
+{
+    const char *txt;
+    if ((causa_reset & RCC_CSR_BORRSTF) && !(causa_reset & RCC_CSR_PORRSTF))
+        txt = "RESET: caida de voltaje (BOR) - revisar alimentacion\r\n";
+    else if (causa_reset & RCC_CSR_PORRSTF)
+        txt = "RESET: encendido (se le quito y regreso la energia)\r\n";
+    else if (causa_reset & (RCC_CSR_IWDGRSTF | RCC_CSR_WWDGRSTF))
+        txt = "RESET: watchdog\r\n";
+    else if (causa_reset & RCC_CSR_SFTRSTF)
+        txt = "RESET: por software (programador/IDE)\r\n";
+    else if (causa_reset & RCC_CSR_PINRSTF)
+        txt = "RESET: pin NRST (boton negro o ST-LINK al conectar)\r\n";
+    else
+        txt = "RESET: causa desconocida\r\n";
+    EnviarMensajeDebug(txt);
+}
+/* Envia una linea con el estado del GPS. */
+static void ReportarGPS(void)
+{
+    const GPS_Data_t *gps = GPS_GetData();
+    char msg[220];
+
+    if (gps->bytes_received == 0U)
+    {
+        EnviarMensajeDebug("GPS: SIN_DATOS (revisar TX del GPS -> PD2, VCC y GND)\r\n");
+        return;
+    }
+    if (gps->sentences_ok == 0U)
+    {
+        snprintf(msg, sizeof(msg),
+                 "GPS: BYTES_SIN_FRASES_VALIDAS bytes=%lu err_chk=%lu err_uart=%lu (revisar 9600 baud)\r\n",
+                 (unsigned long)gps->bytes_received,
+                 (unsigned long)gps->checksum_errors,
+                 (unsigned long)gps->uart_errors);
+        EnviarMensajeDebug(msg);
+        return;
+    }
+    if (GPS_HasFreshFix(GPS_FIX_MAX_AGE_MS) == 0U)
+    {
+        snprintf(msg, sizeof(msg),
+                 "GPS: BUSCANDO_SATELITES SAT=%u UTC=%02u:%02u:%02u\r\n",
+                 (unsigned int)gps->satellites,
+                 (unsigned int)gps->utc_hour,
+                 (unsigned int)gps->utc_minute,
+                 (unsigned int)gps->utc_second);
+        EnviarMensajeDebug(msg);
+        return;
+    }
+    {
+        char lat_txt[16];
+        char lon_txt[16];
+        int32_t alt_dm = gps->altitude_dm;
+        uint32_t alt_abs = (alt_dm < 0) ? (uint32_t)(-(int64_t)alt_dm) : (uint32_t)alt_dm;
+
+        FormatearGrados(lat_txt, sizeof(lat_txt), gps->lat_e7);
+        FormatearGrados(lon_txt, sizeof(lon_txt), gps->lon_e7);
+        snprintf(msg, sizeof(msg),
+                 "GPS: FIX=1 SAT=%u LAT=%s LON=%s VEL=%ld.%02ld m/s RUMBO=%ld.%02ld "
+                 "ALT=%s%lu.%lu m HDOP=%u.%02u UTC=%02u:%02u:%02u\r\n",
+                 (unsigned int)gps->satellites,
+                 lat_txt, lon_txt,
+                 (long)(gps->speed_mm_s / 1000), (long)((gps->speed_mm_s % 1000) / 10),
+                 (long)(gps->course_cdeg / 100), (long)(gps->course_cdeg % 100),
+                 (alt_dm < 0) ? "-" : "",
+                 (unsigned long)(alt_abs / 10U), (unsigned long)(alt_abs % 10U),
+                 (unsigned int)(gps->hdop_x100 / 100U), (unsigned int)(gps->hdop_x100 % 100U),
+                 (unsigned int)gps->utc_hour,
+                 (unsigned int)gps->utc_minute,
+                 (unsigned int)gps->utc_second);
+        EnviarMensajeDebug(msg);
+    }
+}
+/* Envia el mensaje al monitor y a la ESP32 */
+static void EnviarMensajeDebug(const char *mensaje)
+{
+    uint16_t longitud = (uint16_t)strlen(mensaje);
+    HAL_UART_Transmit(&huart2, (uint8_t *)mensaje, longitud, 100);
+    HAL_UART_Transmit(&huart3, (uint8_t *)mensaje, longitud, 100);
+}
+/* Prepara el contador para medir microsegundos */
+static void DWT_Delay_Init(void)
+{
+    CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;
+    DWT->CYCCNT = 0U;
+    DWT->CTRL |= DWT_CTRL_CYCCNTENA_Msk;
+}
+static void DWT_Delay_us(uint32_t us)
+{
+    uint32_t start = DWT->CYCCNT;
+    uint32_t ticks = (SystemCoreClock / 1000000U) * us;
+    while ((DWT->CYCCNT - start) < ticks) { }
+}
+/* Mide la distancia. Si no recibe eco regresa -1 */
+static float Ultrasonic_ReadCm(void)
+{
+    uint32_t startTicks;
+    uint32_t timeoutTicks;
+    uint32_t pulseTicks;
+    uint32_t waitStart;
+    HAL_GPIO_WritePin(US_TRIG_GPIO_Port, US_TRIG_Pin, GPIO_PIN_RESET);
+    DWT_Delay_us(3U);
+    HAL_GPIO_WritePin(US_TRIG_GPIO_Port, US_TRIG_Pin, GPIO_PIN_SET);
+    DWT_Delay_us(10U);
+    HAL_GPIO_WritePin(US_TRIG_GPIO_Port, US_TRIG_Pin, GPIO_PIN_RESET);
+    timeoutTicks = (SystemCoreClock / 1000000U) * US_TIMEOUT_US;
+    waitStart = DWT->CYCCNT;
+    while (HAL_GPIO_ReadPin(US_ECHO_GPIO_Port, US_ECHO_Pin) == GPIO_PIN_RESET)
+    {
+        if ((DWT->CYCCNT - waitStart) > timeoutTicks) return -1.0f;
+    }
+    startTicks = DWT->CYCCNT;
+    while (HAL_GPIO_ReadPin(US_ECHO_GPIO_Port, US_ECHO_Pin) == GPIO_PIN_SET)
+    {
+        if ((DWT->CYCCNT - startTicks) > timeoutTicks) return -1.0f;
+    }
+    pulseTicks = DWT->CYCCNT - startTicks;
+    /* ticks -> microsegundos; distancia = duración(us) * 0.0343 / 2 */
+    return (((float)pulseTicks * 1000000.0f) / (float)SystemCoreClock) * 0.01715f;
+}
+static void SetPWM(float pwm_left, float pwm_right)
+{
+    if (pwm_left < 0.0f) pwm_left = 0.0f;
+    if (pwm_left > PWM_MAX_VALUE) pwm_left = PWM_MAX_VALUE;
+    if (pwm_right < 0.0f) pwm_right = 0.0f;
+    if (pwm_right > PWM_MAX_VALUE) pwm_right = PWM_MAX_VALUE;
+    pwm_actual_izquierdo = pwm_left;
+    pwm_actual_derecho = pwm_right;
+    __HAL_TIM_SET_COMPARE(&htim5, TIM_CHANNEL_1, (uint32_t)(pwm_left + 0.5f));
+    __HAL_TIM_SET_COMPARE(&htim5, TIM_CHANNEL_2, (uint32_t)(pwm_right + 0.5f));
+}
+static void SetForwardDirection(void)
+{
+    /* Motor izquierdo: IN1=0, IN2=1. */
+    HAL_GPIO_WritePin(GPIOA, In1_Pin, GPIO_PIN_RESET);
+    HAL_GPIO_WritePin(IN2_GPIO_Port, IN2_Pin, GPIO_PIN_SET);
+    /* Motor derecho: IN3=1, IN4=0. */
+    HAL_GPIO_WritePin(GPIOA, IN3_Pin, GPIO_PIN_SET);
+    HAL_GPIO_WritePin(GPIOA, IN4_Pin, GPIO_PIN_RESET);
+    HAL_GPIO_WritePin(GPIOA, LD2_Pin, GPIO_PIN_SET);
+}
+static void SetBackwardDirection(void)
+{
+    HAL_GPIO_WritePin(GPIOA, In1_Pin, GPIO_PIN_SET);
+    HAL_GPIO_WritePin(IN2_GPIO_Port, IN2_Pin, GPIO_PIN_RESET);
+    HAL_GPIO_WritePin(GPIOA, IN3_Pin, GPIO_PIN_RESET);
+    HAL_GPIO_WritePin(GPIOA, IN4_Pin, GPIO_PIN_SET);
+    HAL_GPIO_WritePin(GPIOA, LD2_Pin, GPIO_PIN_RESET);
+}
+static void SetTurnLeftDirection(void)
+{
+    /* Se conserva la lógica de giro manual del programa original. */
+    HAL_GPIO_WritePin(GPIOA, In1_Pin, GPIO_PIN_SET);
+    HAL_GPIO_WritePin(IN2_GPIO_Port, IN2_Pin, GPIO_PIN_RESET);
+    HAL_GPIO_WritePin(GPIOA, IN3_Pin, GPIO_PIN_SET);
+    HAL_GPIO_WritePin(GPIOA, IN4_Pin, GPIO_PIN_RESET);
+}
+static void SetTurnRightDirection(void)
+{
+    /* Se conserva la lógica de giro manual del programa original. */
+    HAL_GPIO_WritePin(GPIOA, In1_Pin, GPIO_PIN_RESET);
+    HAL_GPIO_WritePin(IN2_GPIO_Port, IN2_Pin, GPIO_PIN_SET);
+    HAL_GPIO_WritePin(GPIOA, IN3_Pin, GPIO_PIN_RESET);
+    HAL_GPIO_WritePin(GPIOA, IN4_Pin, GPIO_PIN_SET);
+}
+static void StopMotors(void)
+{
+    SetPWM(0.0f, 0.0f);
+    HAL_GPIO_WritePin(IN2_GPIO_Port, IN2_Pin, GPIO_PIN_RESET);
+    HAL_GPIO_WritePin(GPIOA, In1_Pin, GPIO_PIN_RESET);
+    HAL_GPIO_WritePin(GPIOA, IN3_Pin, GPIO_PIN_RESET);
+    HAL_GPIO_WritePin(GPIOA, IN4_Pin, GPIO_PIN_RESET);
+    HAL_GPIO_WritePin(GPIOA, LD2_Pin, GPIO_PIN_RESET);
+}
+/* Angulo, velocidad y disponibilidad de la fuente elegida para los giros. */
+static float YawFuenteDeg(void)
+{
+    return (giro_fuente == GIRO_FUENTE_ENC) ? yaw_enc_deg : yaw_gyro_deg;
+}
+static float RateFuenteDps(void)
+{
+    return (giro_fuente == GIRO_FUENTE_ENC) ? yaw_enc_rate_dps : gyro_rate_dps;
+}
+static uint8_t FuenteGiroOk(void)
+{
+    return (giro_fuente == GIRO_FUENTE_ENC) ? 1U : gyro_ok;
+}
+/* Avance del modo F con correccion de rumbo (giroscopio). Sin giroscopio o
+ * con RECTO_ACTIVO = 0, avanza con PWM fijo como antes. */
+static void PwmAvanceRecto(void)
+{
+    float corr = 0.0f;
+    if ((RECTO_ACTIVO != 0U) && (rumbo_valido != 0U) &&
+        (giro_fuente == GIRO_FUENTE_GYRO) && (gyro_ok != 0U))
+    {
+        float err = yaw_gyro_deg - rumbo_objetivo_deg;
+        corr = RECTO_SIGNO * ((RECTO_KP * err) + (RECTO_KD * gyro_rate_dps));
+        if (corr > RECTO_MAX) corr = RECTO_MAX;
+        if (corr < -RECTO_MAX) corr = -RECTO_MAX;
+    }
+    SetPWM(PWM_MANUAL + corr, PWM_MANUAL - corr);
+}
+/* Reinicia el estado del control fino (llamar al iniciar cada giro de 90). */
+static void PrepararControlGiro(void)
+{
+    uint32_t ahora = HAL_GetTick();
+    giro_subfase = GIRO_SUB_GIRANDO;
+    giro_subfase_ms = ahora;
+    giro_correcciones = 0U;
+    giro_boost = 0.0f;
+    giro_lento_desde_ms = ahora;
+    giro_boost_ms = ahora;
+    giro_enc_ini3 = (uint16_t)__HAL_TIM_GET_COUNTER(&htim3);
+    giro_enc_ini4 = (uint16_t)__HAL_TIM_GET_COUNTER(&htim4);
+    giro_enc_valido = GIRO_EQUILIBRAR_ENC;
+}
+/* PWM de cada rueda durante el giro: perfil + antiatasco + equilibrio. */
+static void PwmGiroControlado(float progreso_deg, float vel_dps)
+{
+    uint32_t ahora = HAL_GetTick();
+    float restante = YAW_TURN_TARGET_DEG - progreso_deg;
+    float base = GIRO_PWM_MIN + (GIRO_KP * restante);
+    float corr = 0.0f;
+
+    if (base > GIRO_PWM_MAX) base = GIRO_PWM_MAX;
+    if (base < GIRO_PWM_MIN) base = GIRO_PWM_MIN;
+
+    /* Antiatasco */
+    if (vel_dps >= GIRO_VEL_MIN_DPS) giro_lento_desde_ms = ahora;
+    if ((ahora - giro_boost_ms) >= 100U)
+    {
+        giro_boost_ms = ahora;
+        if ((ahora - giro_lento_desde_ms) >= GIRO_ATASCO_MS)
+        {
+            giro_boost += GIRO_BOOST_PASO;
+            if (giro_boost > GIRO_BOOST_MAX) giro_boost = GIRO_BOOST_MAX;
+        }
+        else if (giro_boost > 0.0f)
+        {
+            giro_boost -= 0.5f * GIRO_BOOST_PASO;
+            if (giro_boost < 0.0f) giro_boost = 0.0f;
+        }
+    }
+    base += giro_boost;
+
+    /* Pivote centrado: que las dos ruedas avancen lo mismo. */
+    if (giro_enc_valido != 0U)
+    {
+        int32_t d_der = abs((int)(int16_t)((uint16_t)__HAL_TIM_GET_COUNTER(&htim3) - giro_enc_ini3));
+        int32_t d_izq = abs((int)(int16_t)((uint16_t)__HAL_TIM_GET_COUNTER(&htim4) - giro_enc_ini4));
+        int32_t mayor = (d_der > d_izq) ? d_der : d_izq;
+        int32_t menor = (d_der > d_izq) ? d_izq : d_der;
+        if ((mayor > 150) && ((menor * 10) < (mayor * 3)))
+        {
+            /* Una rueda casi no cuenta: encoder dudoso, no equilibrar. */
+            giro_enc_valido = 0U;
+            EnviarMensajeDebug("GIRO_WARN: encoders muy distintos; sin equilibrio de ruedas\r\n");
+        }
+        else
+        {
+            corr = GIRO_ENC_KP * (float)(d_izq - d_der);   /* + = izquierda va adelantada */
+            if (corr > GIRO_ENC_MAX) corr = GIRO_ENC_MAX;
+            if (corr < -GIRO_ENC_MAX) corr = -GIRO_ENC_MAX;
+        }
+    }
+    SetPWM(base - corr, base + corr);
+}
+/* Inicia un giro de 90 grados del rodeo hacia dir (+1 derecha, -1 izquierda)
+ * con rumbo absoluto: parte del objetivo anterior. */
+static void IniciarGiroEvasion(int8_t dir)
+{
+    yaw_turn_inicio_deg = (rumbo_valido != 0U) ? rumbo_objetivo_deg : YawFuenteDeg();
+    yaw_turn_direction = dir;
+    rumbo_objetivo_deg = yaw_turn_inicio_deg - ((float)dir * YAW_TURN_TARGET_DEG);
+    rumbo_valido = 1U;
+    yaw_turn_progress_deg = 0.0f;
+    giro_final_pendiente = 0U;
+    yaw_turn_start_ms = HAL_GetTick();
+    yaw_turn_last_valid_ms = yaw_turn_start_ms;
+    yaw_turn_active = 1U;
+    estado_giro = 1U;
+    PrepararControlGiro();
+    if (dir > 0) SetTurnRightDirection();
+    else SetTurnLeftDirection();
+    SetPWM(GIRO_PWM_MAX, GIRO_PWM_MAX);
+}
+/* Inicia un tramo recto del rodeo (LATERAL, PASAR o REGRESO). */
+static void IniciarTramoEvasion(uint8_t fase)
+{
+    evasion_fase = fase;
+    evasion_seg_m = 0.0f;
+    evasion_fase_ms = HAL_GetTick();
+    SetForwardDirection();
+    SetPWM(PWM_MANUAL, PWM_MANUAL);
+}
+/* Integra el angulo por diferencia de encoders (llamar en cada vuelta).
+ * Adelante ambos encoders suben; giro derecha: izq +, der - -> yaw baja. */
+static void ActualizarYawEncoders(void)
+{
+    uint16_t c3 = (uint16_t)__HAL_TIM_GET_COUNTER(&htim3);   /* derecho */
+    uint16_t c4 = (uint16_t)__HAL_TIM_GET_COUNTER(&htim4);   /* izquierdo */
+    int16_t d_der = (int16_t)(c3 - enc_yaw_prev3);
+    int16_t d_izq = (int16_t)(c4 - enc_yaw_prev4);
+    uint32_t ahora = HAL_GetTick();
+
+    enc_yaw_prev3 = c3;
+    enc_yaw_prev4 = c4;
+    yaw_enc_deg += ((float)(d_der - d_izq) * distance_per_count / TRACK_WIDTH_M)
+                   * 57.2957795f * ENC_GIRO_ESCALA;
+
+    /* Velocidad angular en ventanas de >= 30 ms (para la anticipacion). */
+    if ((ahora - enc_rate_ref_ms) >= 30U)
+    {
+        yaw_enc_rate_dps = (yaw_enc_deg - enc_rate_ref_deg) * 1000.0f /
+                           (float)(ahora - enc_rate_ref_ms);
+        enc_rate_ref_deg = yaw_enc_deg;
+        enc_rate_ref_ms = ahora;
+    }
+}
+/* Letras que se aceptan como comando (ver mapa de teclas al inicio). */
+static uint8_t EsLetraComando(uint8_t c)
+{
+    switch (c)
+    {
+        case 'F': case 'R': case 'I': case 'S':
+        case 'Q': case 'q':
+        case 'w': case 'W': case 'a': case 'A':
+        case 's': case 'd': case 'D':
+        case 'B': case 'L':          /* compatibilidad con la app/ESP32 */
+            return 1U;
+        default:
+            return 0U;
+    }
+}
+/* Recibe comandos desde ESP32 (USART3) y Tera Term (USART2).
+ * Solo cuenta como comando una letra AISLADA: sin otro byte en los
+ * CMD_GAP_MS anteriores ni posteriores (se permiten \r y \n despues).
+ * Asi, las letras dentro de texto (p. ej. el eco de la telemetria cuando
+ * la ESP32 esta apagada) nunca se interpretan como comandos. */
+void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
+{
+    uint8_t dato;
+    uint8_t idx;
+    uint32_t ahora;
+
+    if (huart->Instance == USART2)
+    {
+        dato = rxDatoUSART2;
+        idx = 0U;
+    }
+    else if (huart->Instance == USART3)
+    {
+        dato = rxDatoUSART3;
+        idx = 1U;
+    }
+    else
+    {
+        return;
+    }
+
+    ahora = HAL_GetTick();
+    /* DIAGNOSTICO temporal: letras sueltas que llegan desde la ESP32. */
+    if ((idx == 1U) && ((ahora - uart_ultimo_byte_ms[1]) >= CMD_GAP_MS) &&
+        (dato >= 0x21U) && (dato <= 0x7EU))
+    {
+        uint8_t sig = (uint8_t)((rx_esp_diag_head + 1U) % 8U);
+        if (sig != rx_esp_diag_tail)
+        {
+            rx_esp_diag[rx_esp_diag_head] = dato;
+            rx_esp_diag_head = sig;
+        }
+    }
+    if (EsLetraComando(dato) != 0U)
+    {
+        if ((ahora - uart_ultimo_byte_ms[idx]) >= CMD_GAP_MS)
+        {
+            uart_cmd_candidato[idx] = (char)dato;
+            uart_cmd_candidato_ms[idx] = ahora;
+        }
+        else
+        {
+            uart_cmd_candidato[idx] = 0;   /* letra pegada a otro texto */
+        }
+    }
+    else if ((dato != '\r') && (dato != '\n'))
+    {
+        uart_cmd_candidato[idx] = 0;       /* llego texto: no era comando */
+    }
+    uart_ultimo_byte_ms[idx] = ahora;
+
+    if (idx == 0U)
+    {
+        HAL_UART_Receive_IT(&huart2, &rxDatoUSART2, 1);
+    }
+    else
+    {
+        HAL_UART_Receive_IT(&huart3, &rxDatoUSART3, 1);
+    }
+}
+/* Error de UART (overrun, ruido, framing). Con overrun el HAL apaga la
+ * recepcion: se limpian las banderas y se vuelve a encender. */
+void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
+{
+    __HAL_UART_CLEAR_OREFLAG(huart);   /* lee SR y DR: limpia ORE/NE/FE/PE */
+    huart->ErrorCode = HAL_UART_ERROR_NONE;
+    uart_rx_errores++;
+
+    if (huart->Instance == USART2)
+    {
+        HAL_UART_Receive_IT(&huart2, &rxDatoUSART2, 1);
+    }
+    else if (huart->Instance == USART3)
+    {
+        HAL_UART_Receive_IT(&huart3, &rxDatoUSART3, 1);
+    }
+}
+/* Entrega el siguiente comando confirmado (letra aislada con al menos
+ * CMD_GAP_MS de antiguedad). Regresa 0 si no hay. */
+static char TomarComando(uint32_t *momento_ms)
+{
+    char cmd = 0;
+    uint8_t idx;
+
+    __disable_irq();
+    {
+        uint32_t ahora = HAL_GetTick();
+        for (idx = 0U; idx < 2U; idx++)
+        {
+            if ((uart_cmd_candidato[idx] != 0) &&
+                ((ahora - uart_cmd_candidato_ms[idx]) >= CMD_GAP_MS))
+            {
+                cmd = uart_cmd_candidato[idx];
+                *momento_ms = uart_cmd_candidato_ms[idx];
+                uart_cmd_candidato[idx] = 0;
+                break;
+            }
+        }
+    }
+    __enable_irq();
+    return cmd;
+}
+/* USER CODE END 0 --------------------------------------------------------- */
+int main(void)
+{
+    /* Guardar la causa del reinicio antes de que algo la borre. */
+    causa_reset = RCC->CSR;
+    RCC->CSR |= RCC_CSR_RMVF;
+    HAL_Init();
+    SystemClock_Config();
+    MX_GPIO_Init();
+    MX_USART2_UART_Init();
+    MX_USART3_UART_Init();
+    MX_TIM3_Init();
+    MX_TIM4_Init();
+    MX_TIM5_Init();
+    MX_I2C1_Init();
+    DWT_Delay_Init();
+    ReportarCausaReset();
+    /* Registro de giros en flash: mostrar lo guardado y marcar este arranque. */
+    LogIniciar();
+    LogImprimir();
+    LogEscribir(LOG_TIPO_ARRANQUE, 0.0f, 0.0f);
+    /* Inicializar MPU-9250 / AK8963 sin alterar motores, encoders ni BLE */
+    HAL_Delay(50U);
+    if (MPU9250_Init(&hi2c1) == HAL_OK)
+    {
+        if (MPU9250_GetDiagnostics(&hi2c1, &imuDiag) == HAL_OK)
+        {
+            char diag_msg[160];
+            snprintf(diag_msg, sizeof(diag_msg),
+                     "I2C_DIAG: MPU_WHO=0x%02X AK_WHO=0x%02X ASA=%u,%u,%u\r\n",
+                     imuDiag.mpu_who_am_i, imuDiag.ak_who_am_i,
+                     imuDiag.asa_x_raw, imuDiag.asa_y_raw, imuDiag.asa_z_raw);
+            EnviarMensajeDebug(diag_msg);
+        }
+        imuStatus = 1U;
+        /* Giroscopio: medir el sesgo con el carro QUIETO (hasta 3 intentos). */
+        if (MPU9250_GyroInit(&hi2c1) == HAL_OK)
+        {
+            uint8_t intento;
+            uint8_t vertical_ok = 0U;
+            float norma_g = 0.0f;
+            EnviarMensajeDebug("GYRO: deja el carro QUIETO 2 s (vertical y sesgo)\r\n");
+            /* 1) Que eje del sensor apunta hacia arriba (acelerometro). */
+            {
+                char up_msg[140];
+                int ax;
+                int ay;
+                int az;
+                int ng;
+                uint8_t mayor = 0U;
+                HAL_StatusTypeDef st_up = MPU9250_DetectVertical(&hi2c1, GYRO_USAR_Z,
+                                                                 imu_up, &norma_g);
+                ax = (int)(imu_up[0] * 100.0f);
+                ay = (int)(imu_up[1] * 100.0f);
+                az = (int)(imu_up[2] * 100.0f);
+                ng = (int)(norma_g * 100.0f);
+                if (fabsf(imu_up[1]) > fabsf(imu_up[mayor])) mayor = 1U;
+                if (fabsf(imu_up[2]) > fabsf(imu_up[mayor])) mayor = 2U;
+                snprintf(up_msg, sizeof(up_msg),
+                    "IMU_VERTICAL: X=%c%d.%02d Y=%c%d.%02d Z=%c%d.%02d (|a|=%d.%02d g) -> arriba=%c%c\r\n",
+                    (ax < 0) ? '-' : '+', abs(ax) / 100, abs(ax) % 100,
+                    (ay < 0) ? '-' : '+', abs(ay) / 100, abs(ay) % 100,
+                    (az < 0) ? '-' : '+', abs(az) / 100, abs(az) % 100,
+                    ng / 100, abs(ng % 100),
+                    (imu_up[mayor] < 0.0f) ? '-' : '+', (char)('X' + mayor));
+                EnviarMensajeDebug(up_msg);
+                if (st_up == HAL_OK)
+                {
+                    vertical_ok = 1U;
+                }
+                else if ((norma_g < 0.7f) || (norma_g > 1.3f))
+                {
+                    EnviarMensajeDebug("GYRO_WARN: el acelerometro no mide 1 g; giros con ENCODERS\r\n");
+                }
+                else
+                {
+                    EnviarMensajeDebug("GYRO_WARN: IMU plana (Z vertical, eje Z danado); "
+                                       "monta la placa de canto. Giros con ENCODERS\r\n");
+                }
+            }
+            /* 2) Sesgo de la velocidad proyectada a la vertical. */
+            for (intento = 0U; (vertical_ok != 0U) && (intento < 3U) && (gyro_ok == 0U); intento++)
+            {
+                if (MPU9250_GyroCalibrateBias(&hi2c1, GYRO_BIAS_MS, &gyro_bias_dps) == HAL_OK)
+                {
+                    char gyro_msg[80];
+                    int bias_x100 = (int)(gyro_bias_dps * 100.0f);
+                    gyro_ok = 1U;
+                    gyro_last_ok_ms = HAL_GetTick();
+                    snprintf(gyro_msg, sizeof(gyro_msg), "GYRO_OK: sesgo=%s%d.%02d dps\r\n",
+                             (bias_x100 < 0) ? "-" : "", abs(bias_x100) / 100, abs(bias_x100) % 100);
+                    EnviarMensajeDebug(gyro_msg);
+                }
+                else
+                {
+                    EnviarMensajeDebug("GYRO_WARN: movimiento detectado; repitiendo, no muevas el carro\r\n");
+                }
+            }
+            if ((vertical_ok != 0U) && (gyro_ok == 0U))
+            {
+                EnviarMensajeDebug("GYRO_ERROR: no se pudo medir el sesgo; giros con ENCODERS\r\n");
+            }
+            /* DIAGNOSTICO: sesgo proyectado leido directo (carro quieto). */
+            if (gyro_ok != 0U)
+            {
+                float suma_z = 0.0f;
+                float xyz[3];
+                uint16_t fb;
+                uint8_t k;
+                uint8_t validas = 0U;
+                for (k = 0U; k < 50U; k++)
+                {
+                    if (MPU9250_GyroReadDirect(&hi2c1, xyz, &fb) == HAL_OK)
+                    {
+                        suma_z += MPU9250_GyroProject(xyz);
+                        validas++;
+                    }
+                    HAL_Delay(5U);
+                }
+                if (validas > 0U) diag_bias_z_dps = suma_z / (float)validas;
+                diag_last_ms = HAL_GetTick();
+            }
+        }
+        else
+        {
+            EnviarMensajeDebug("GYRO_ERROR: no se pudo configurar el giroscopio\r\n");
+        }
+        giro_fuente = ((GIRO_FUENTE_PREFERIDA == GIRO_FUENTE_GYRO) && (gyro_ok != 0U))
+                      ? GIRO_FUENTE_GYRO : GIRO_FUENTE_ENC;
+        EnviarMensajeDebug((giro_fuente == GIRO_FUENTE_GYRO)
+                           ? "GIRO_FUENTE: GIROSCOPIO (R y evasion)\r\n"
+                           : "GIRO_FUENTE: ENCODERS (R y evasion)\r\n");
+        imu_zero_valid = 0U;
+        imu_zero_samples = 0U;
+        imu_zero_sin_sum = 0.0f;
+        imu_zero_cos_sum = 0.0f;
+        EnviarMensajeDebug("MPU9250_OK: gira lentamente el carrito en horizontal durante 15 s para calibrar el magnetometro\r\n");
+        if (MPU9250_CalibrateMag(&hi2c1) == HAL_OK)
+            EnviarMensajeDebug("CAL_MAG_OK: calibracion magnetica terminada\r\n");
+        else
+            EnviarMensajeDebug("CAL_MAG_ERROR: cobertura insuficiente; revisar montaje y repetir\r\n");
+        EnviarMensajeDebug("Coloca el carrito recto y quieto para fijar el cero angular\r\n");
+    }
+    else
+    {
+        imuStatus = 0U;
+        {
+            char err_msg[100];
+            snprintf(err_msg, sizeof(err_msg),
+                     "ERROR_MPU9250: HAL_I2C_ERROR=0x%08lX; revisar WHO_AM_I, I2C y AD0\r\n",
+                     (unsigned long)HAL_I2C_GetError(&hi2c1));
+            EnviarMensajeDebug(err_msg);
+        }
+    }
+    /* GPS NEO-6M: UART5, TX del GPS -> PD2, 9600 baudios. */
+    if (GPS_Init() == HAL_OK)
+    {
+        EnviarMensajeDebug("GPS: UART5 lista (TX del GPS -> PD2, 9600 baud)\r\n");
+    }
+    else
+    {
+        EnviarMensajeDebug("ERROR_GPS: no se pudo iniciar UART5\r\n");
+    }
+    last_gps_report_time = HAL_GetTick();
+    /* Recepción simultánea desde Tera Term (USART2) y ESP32 (USART3).
+     * Descartar lo que llego durante la calibracion (evita overrun al
+     * arrancar y que una tecla vieja se ejecute como comando). */
+    __HAL_UART_CLEAR_OREFLAG(&huart2);
+    __HAL_UART_CLEAR_OREFLAG(&huart3);
+    uart_cmd_candidato[0] = 0;
+    uart_cmd_candidato[1] = 0;
+    if (HAL_UART_Receive_IT(&huart2, &rxDatoUSART2, 1) != HAL_OK)
+    {
+        EnviarMensajeDebug("ERROR: no se pudo iniciar RX de USART2 (Tera Term)\r\n");
+    }
+    if (HAL_UART_Receive_IT(&huart3, &rxDatoUSART3, 1) != HAL_OK)
+    {
+        EnviarMensajeDebug("ERROR: no se pudo iniciar RX de USART3 (ESP32)\r\n");
+    }
+    if (HAL_TIM_PWM_Start(&htim5, TIM_CHANNEL_1) != HAL_OK)
+    {
+        Error_Handler();
+    }
+    if (HAL_TIM_PWM_Start(&htim5, TIM_CHANNEL_2) != HAL_OK)
+    {
+        Error_Handler();
+    }
+    SetPWM(0.0f, 0.0f);
+    if (HAL_TIM_Encoder_Start(&htim3, TIM_CHANNEL_ALL) != HAL_OK)
+    {
+        Error_Handler();
+    }
+    if (HAL_TIM_Encoder_Start(&htim4, TIM_CHANNEL_ALL) != HAL_OK)
+    {
+        Error_Handler();
+    }
+    __HAL_TIM_SET_COUNTER(&htim3, 0);
+    __HAL_TIM_SET_COUNTER(&htim4, 0);
+    /* Configuracion del sensor ultrasonico */
+    HAL_GPIO_WritePin(US_TRIG_GPIO_Port, US_TRIG_Pin, GPIO_PIN_RESET);
+    distance_per_count =(PI_VALUE * WHEEL_DIAMETER_M) / ENCODER_COUNTS_PER_REV;
+    encoder3_previous = 0;
+    encoder4_previous = 0;
+    last_rpm_time = HAL_GetTick();
+    uint32_t last_ultrasonic_time = HAL_GetTick();
+    uint8_t obstaculo_detectado = 0U;
+    {
+        char mensaje_inicio[] =
+                "\r\nCarro listo\r\n"
+                "Manejo (mantener presionado): w adelante, s atras, a izquierda, d derecha\r\n"
+                "Parar: q (tambien S mayuscula)\r\n"
+                "Bluetooth/app: B atras, L izquierda (hasta S)\r\n"
+                "Especiales: F auto 2.5 m, R giro 90 derecha, I prueba lazo abierto 5 s\r\n"
+                "Boton azul: toque = giro R, mantener 1 s = modo F; en movimiento = STOP\r\n"
+                "Encoders y sensor ultrasonico activos\r\n\r\n";
+        EnviarMensajeDebug(mensaje_inicio);
+    }
+    while (1)
+    {
+        /* GPS: decodificar lo recibido y reportar una vez por segundo. */
+        GPS_Process();
+        if ((HAL_GetTick() - last_gps_report_time) >= GPS_REPORT_INTERVAL_MS)
+        {
+            last_gps_report_time = HAL_GetTick();
+            ReportarGPS();
+            LogImprimir();
+        }
+        /* Boton azul:
+         *  - carro en movimiento: presionar = STOP inmediato.
+         *  - carro parado: toque corto = giro R; mantener >= 1 s (LD2 fijo) = modo F.
+         *    Al soltar empieza la cuenta regresiva de 1.5 s (LD2 parpadea). */
+        {
+            uint32_t ahora_b = HAL_GetTick();
+            uint8_t boton = (HAL_GPIO_ReadPin(B1_GPIO_Port, B1_Pin) == GPIO_PIN_RESET) ? 0U : 1U;
+            uint8_t en_movimiento = ((modo_automatico != 0U) || (yaw_turn_active != 0U) ||
+                                     (wasd_cmd != 0) || (modo_lazo_abierto != 0U) ||
+                                     (pwm_actual_izquierdo > 0.0f) || (pwm_actual_derecho > 0.0f))
+                                    ? 1U : 0U;
+            if ((boton != boton_estado_prev) &&
+                ((ahora_b - boton_cambio_ms) >= BOTON_ANTIRREBOTE_MS))
+            {
+                boton_cambio_ms = ahora_b;
+                boton_estado_prev = boton;
+                if (boton == 0U)
+                {
+                    /* Presionado */
+                    boton_presion_ms = ahora_b;
+                    boton_ignorar_soltar = 0U;
+                    if ((en_movimiento != 0U) || (boton_armado != 0U))
+                    {
+                        /* Paro de emergencia (o cancelar la cuenta regresiva). */
+                        boton_armado = 0U;
+                        boton_ignorar_soltar = 1U;
+                        boton_cmd_inmediato = 'S';
+                        EnviarMensajeDebug("BOTON: STOP\r\n");
+                    }
+                }
+                else if (boton_ignorar_soltar == 0U)
+                {
+                    /* Soltado: decidir R o F segun lo que duro presionado. */
+                    boton_cmd = ((ahora_b - boton_presion_ms) >= BOTON_LARGO_MS) ? 'F' : 'R';
+                    boton_armado = 1U;
+                    boton_armado_ms = ahora_b;
+                    EnviarMensajeDebug((boton_cmd == 'F')
+                        ? "BOTON: modo F (evasion) en 1.5 s, retira la mano\r\n"
+                        : "BOTON: giro R en 1.5 s, retira la mano\r\n");
+                }
+            }
+            /* Mientras se mantiene presionado: LD2 fijo al pasar 1 s = sera F. */
+            if ((boton == 0U) && (boton_ignorar_soltar == 0U))
+            {
+                HAL_GPIO_WritePin(GPIOA, LD2_Pin,
+                                  ((ahora_b - boton_presion_ms) >= BOTON_LARGO_MS) ? GPIO_PIN_SET
+                                                                                  : GPIO_PIN_RESET);
+            }
+            if (boton_armado != 0U)
+            {
+                /* LD2 parpadea a 5 Hz durante la espera. */
+                HAL_GPIO_WritePin(GPIOA, LD2_Pin,
+                                  (((ahora_b - boton_armado_ms) / 100U) % 2U) ? GPIO_PIN_SET
+                                                                              : GPIO_PIN_RESET);
+            }
+        }
+        /* MPU-9250: lectura periodica a 50 Hz.
+         * La primera lectura valida fija el cero angular con el carro quieto
+         * y apuntando en la direccion que se considerara 0 grados.
+         * La telemetria se envia junto con los encoders, en una sola linea.
+         * Esta lectura no modifica motores, PI, PWM ni seguridad.
+         */
+        if (imuStatus == 1U)
+        {
+            uint32_t now_imu = HAL_GetTick();
+            if ((now_imu - last_imu_read_time) >= IMU_READ_INTERVAL_MS)
+            {
+                last_imu_read_time = now_imu;
+                if (MPU9250_ReadHeading(&hi2c1, &imuData) == HAL_OK)
+                {
+                    /* No aceptar rumbos calculados con campo horizontal casi nulo.
+                       El umbral es diagnóstico/provisional; validar en el montaje real. */
+                    float mag_xy = sqrtf(imuData.mag_x_uT * imuData.mag_x_uT +
+                                         imuData.mag_y_uT * imuData.mag_y_uT);
+                    imu_mag_valid = (mag_xy >= 10.0f && mag_xy <= 100.0f &&
+                                     imuData.mag_norm_uT >= 15.0f && imuData.mag_norm_uT <= 100.0f) ? 1U : 0U;
+                    if (imu_mag_valid == 0U)
+                    {
+                        if ((HAL_GetTick() - last_imu_error_report) > 1000U)
+                        {
+                            EnviarMensajeDebug("IMU_WARN: campo magnetico fuera de rango; YAW retenido\r\n");
+                            last_imu_error_report = HAL_GetTick();
+                        }
+                    }
+                    else if (imu_zero_valid == 0U)
+                    {
+                        float angulo_rad = imuData.heading_deg * 0.01745329252f;
+                        imu_zero_sin_sum += sinf(angulo_rad);
+                        imu_zero_cos_sum += cosf(angulo_rad);
+                        imu_zero_samples++;
+                        if (imu_zero_samples >= 100U)
+                        {
+                            imu_heading_zero_deg = atan2f(imu_zero_sin_sum, imu_zero_cos_sum) * 57.2957795131f;
+                            if (imu_heading_zero_deg < 0.0f) imu_heading_zero_deg += 360.0f;
+                            imu_heading_relative_deg = 0.0f;
+                            imu_zero_valid = 1U;
+                            EnviarMensajeDebug("IMU: cero angular promedio de 100 lecturas establecido\r\n");
+                        }
+                    }
+                    else if (imu_mag_valid != 0U)
+                    {
+                        float relativo = imuData.heading_deg - imu_heading_zero_deg;
+                        while (relativo < 0.0f) relativo += 360.0f;
+                        while (relativo >= 360.0f) relativo -= 360.0f;
+                        if (relativo > 180.0f) relativo -= 360.0f;
+                        imu_heading_relative_deg = relativo;
+                        /* El magnetometro ya no controla los giros: solo da el
+                         * rumbo absoluto (telemetria y waypoints a futuro). */
+                    }
+                }
+            }
+        }
+        /* Giroscopio Z: leer la FIFO e integrar el angulo (cada 10 ms). */
+        if (gyro_ok != 0U)
+        {
+            uint32_t now_gyro = HAL_GetTick();
+            if ((now_gyro - last_gyro_read_ms) >= 10U)
+            {
+                float suma_grados = 0.0f;
+                float ultima_dps = 0.0f;
+                uint16_t muestras = 0U;
+                HAL_StatusTypeDef st_gyro;
+
+                last_gyro_read_ms = now_gyro;
+                st_gyro = MPU9250_GyroRead(&hi2c1, gyro_bias_dps,
+                                           &suma_grados, &ultima_dps, &muestras);
+                if ((st_gyro == HAL_OK) && (muestras > 0U))
+                {
+                    yaw_gyro_deg += GYRO_Z_SIGNO * suma_grados;
+                    gyro_rate_dps = GYRO_Z_SIGNO * ultima_dps;
+                    gyro_last_ok_ms = now_gyro;
+                    /* Con las ruedas paradas, ajustar lentamente el sesgo. */
+                    if (((now_gyro - gyro_quieto_desde_ms) >= GYRO_ZUPT_QUIETO_MS) &&
+                        (fabsf(ultima_dps) < GYRO_ZUPT_MAX_DPS))
+                    {
+                        gyro_bias_dps += GYRO_ZUPT_ALFA * ultima_dps;
+                    }
+                }
+                else if (st_gyro == HAL_BUSY)
+                {
+                    gyro_desbordes++;
+                }
+                /* DIAGNOSTICO: lectura directa e integracion de Z sin FIFO. */
+                if (MPU9250_GyroReadDirect(&hi2c1, diag_gyro_dps, &diag_fifo_bytes) == HAL_OK)
+                {
+                    float dt_d = (float)(now_gyro - diag_last_ms) / 1000.0f;
+                    if (dt_d > 0.1f) dt_d = 0.1f;
+                    diag_yaw_d_deg += GYRO_Z_SIGNO *
+                                      (MPU9250_GyroProject(diag_gyro_dps) - diag_bias_z_dps) * dt_d;
+                    diag_last_ms = now_gyro;
+                }
+            }
+        }
+        /* Angulo por encoders (siempre, tambien para telemetria). */
+        ActualizarYawEncoders();
+        /* Control del giro de 90 grados con la fuente elegida (GIRO_FUENTE).
+         * Angulos: izquierda +, derecha -. direction +1 = derecha. */
+        if ((yaw_turn_active != 0U) && (FuenteGiroOk() != 0U))
+        {
+            float vel_progreso = ((float)yaw_turn_direction) * (-RateFuenteDps());
+            float anticipo = (vel_progreso > 0.0f) ? (vel_progreso * GIRO_ANTICIPO_S) : 0.0f;
+
+            yaw_turn_progress_deg = ((float)yaw_turn_direction) *
+                                    (-(YawFuenteDeg() - yaw_turn_inicio_deg));
+            yaw_turn_last_valid_ms = (giro_fuente == GIRO_FUENTE_ENC) ? HAL_GetTick()
+                                                                     : gyro_last_ok_ms;
+
+            if (giro_subfase == GIRO_SUB_GIRANDO)
+            {
+                if ((yaw_turn_progress_deg + anticipo) >= YAW_TURN_TARGET_DEG)
+                {
+                    giro_vel_al_frenar = vel_progreso;
+                    StopMotors();
+                    giro_subfase = GIRO_SUB_ASENTANDO;
+                    giro_subfase_ms = HAL_GetTick();
+                }
+                else if (yaw_turn_progress_deg < -YAW_TURN_WRONG_LIMIT_DEG)
+                {
+                    StopMotors();
+                    yaw_turn_active = 0U;
+                    if (modo_automatico != 0U) { modo_automatico = 0U; estado_giro = 0U; }
+                    if (giros_fallidos < 255U) giros_fallidos++;
+                    LogEscribir(LOG_TIPO_FALLO, yaw_turn_progress_deg, 0.0f);
+                    EnviarMensajeDebug("YAW_TURN_ERROR: sentido angular contrario; motores detenidos\r\n");
+                }
+                else
+                {
+                    PwmGiroControlado(yaw_turn_progress_deg, vel_progreso);
+                }
+            }
+            else if (giro_subfase == GIRO_SUB_CORRIGIENDO)
+            {
+                float err_c = YAW_TURN_TARGET_DEG - yaw_turn_progress_deg;
+                float margen = (GIRO_TOL_DEG * 0.5f) + (fabsf(vel_progreso) * GIRO_ANTICIPO_S);
+                if (((err_c * giro_corr_err_ini) <= 0.0f) || (fabsf(err_c) <= margen) ||
+                    ((HAL_GetTick() - giro_subfase_ms) >= GIRO_CORR_MAX_MS))
+                {
+                    StopMotors();
+                    giro_subfase = GIRO_SUB_ASENTANDO;
+                    giro_subfase_ms = HAL_GetTick();
+                }
+            }
+            else if ((HAL_GetTick() - giro_subfase_ms) >= GIRO_ASENTAR_MS)
+            {
+                /* ASENTANDO terminado: corregir si hace falta, o dar por hecho. */
+                float err_a = YAW_TURN_TARGET_DEG - yaw_turn_progress_deg;
+                if ((fabsf(err_a) > GIRO_TOL_DEG) && (giro_correcciones < GIRO_CORR_MAX))
+                {
+                    char corr_msg[80];
+                    int e10 = (int)(err_a * 10.0f);
+                    uint8_t a_la_derecha = (err_a > 0.0f) ? ((yaw_turn_direction > 0) ? 1U : 0U)
+                                                          : ((yaw_turn_direction > 0) ? 0U : 1U);
+                    giro_correcciones++;
+                    giro_corr_err_ini = err_a;
+                    giro_subfase = GIRO_SUB_CORRIGIENDO;
+                    giro_subfase_ms = HAL_GetTick();
+                    if (a_la_derecha != 0U) SetTurnRightDirection();
+                    else SetTurnLeftDirection();
+                    SetPWM(GIRO_CORR_PWM, GIRO_CORR_PWM);
+                    snprintf(corr_msg, sizeof(corr_msg), "GIRO_CORRIGE: faltan %s%d.%d deg\r\n",
+                             (e10 < 0) ? "-" : "", abs(e10) / 10, abs(e10) % 10);
+                    EnviarMensajeDebug(corr_msg);
+                }
+                else
+                {
+                char yaw_msg[140];
+                int yaw_x100 = (int)(yaw_turn_progress_deg * 100.0f);
+                yaw_turn_active = 0U;
+                giro_final_pendiente = 1U;
+                giro_final_ms = HAL_GetTick();
+                snprintf(yaw_msg, sizeof(yaw_msg),
+                    "EVASION_GIRO_OK,%s,progreso=%d.%02d_deg (%s)\r\n",
+                    (yaw_turn_direction > 0) ? "DERECHA" : "IZQUIERDA",
+                    yaw_x100 / 100, abs(yaw_x100 % 100),
+                    (giro_fuente == GIRO_FUENTE_ENC) ? "encoders" : "giroscopio");
+                EnviarMensajeDebug(yaw_msg);
+                if (modo_automatico != 0U && estado_giro == 1U)
+                {
+                    obstaculo_detectado = 0U;
+                    last_ultrasonic_time = HAL_GetTick();
+                    /* Pausa corta tras cada giro (que se asiente la inercia)
+                     * y luego la siguiente fase. */
+                    if ((evasion_fase == EV_GIRO1) && (EVASION_RODEO != 0U)) evasion_sig_fase = EV_LATERAL;
+                    else if (evasion_fase == EV_GIRO2) evasion_sig_fase = EV_PASAR;
+                    else if (evasion_fase == EV_GIRO3) evasion_sig_fase = EV_REGRESO;
+                    else evasion_sig_fase = EV_NINGUNA;   /* GIRO4, o GIRO1 sin rodeo */
+                    evasion_fase = EV_PAUSA;
+                    evasion_fase_ms = HAL_GetTick();
+                }
+                }
+            }
+        }
+        /* Angulo final real del giro (incluye la inercia tras frenar). */
+        if ((giro_final_pendiente != 0U) &&
+            ((HAL_GetTick() - giro_final_ms) >= GIRO_FINAL_ESPERA_MS))
+        {
+            char final_msg[90];
+            float final_deg = ((float)yaw_turn_direction) *
+                              (-(YawFuenteDeg() - yaw_turn_inicio_deg));
+            int final_x100 = (int)(final_deg * 100.0f);
+            giro_final_pendiente = 0U;
+            ult_giros_deg[ult_giros_cuenta % ULT_GIROS_N] = final_deg;
+            if (ult_giros_cuenta < 255U) ult_giros_cuenta++;
+            LogEscribir(LOG_TIPO_OK, final_deg, giro_vel_al_frenar);
+            snprintf(final_msg, sizeof(final_msg),
+                     "GIRO_FINAL=%s%d.%02d deg (objetivo 90; ajustar GIRO_ANTICIPO_S / ENC_GIRO_ESCALA)\r\n",
+                     (final_x100 < 0) ? "-" : "", abs(final_x100) / 100, abs(final_x100) % 100);
+            EnviarMensajeDebug(final_msg);
+        }
+        /* Modo F avanzando: corregir el rumbo en cada lectura del giroscopio. */
+        if ((modo_automatico != 0U) && (estado_giro == 0U) && (yaw_turn_active == 0U) &&
+            ((pwm_actual_izquierdo > 0.0f) || (pwm_actual_derecho > 0.0f)))
+        {
+            PwmAvanceRecto();
+        }
+        /* Rodeo del obstaculo: reversa y tramos rectos (los giros los
+         * maneja el control de giro de arriba). */
+        if ((modo_automatico != 0U) && (yaw_turn_active == 0U))
+        {
+            uint32_t ahora_ev = HAL_GetTick();
+            if ((evasion_fase == EV_FRENO) && ((ahora_ev - evasion_fase_ms) >= EV_FRENO_MS))
+            {
+                evasion_fase = EV_RETRO;
+                evasion_fase_ms = ahora_ev;
+                SetBackwardDirection();
+                SetPWM(EV_RETRO_PWM, EV_RETRO_PWM);
+                EnviarMensajeDebug("EVASION: retrocedo lento\r\n");
+            }
+            else if ((evasion_fase == EV_RETRO) && ((ahora_ev - evasion_fase_ms) >= EV_RETRO_MS))
+            {
+                StopMotors();
+                evasion_fase = EV_PAUSA;
+                evasion_fase_ms = ahora_ev;
+                evasion_sig_fase = EV_GIRO1;
+                evasion_sig_dir = evasion_lado;
+            }
+            else if ((evasion_fase == EV_PAUSA) && ((ahora_ev - evasion_fase_ms) >= EV_PAUSA_MS))
+            {
+                uint8_t sig = evasion_sig_fase;
+                if ((sig == EV_GIRO1) || (sig == EV_GIRO2) || (sig == EV_GIRO3) || (sig == EV_GIRO4))
+                {
+                    evasion_fase = sig;
+                    IniciarGiroEvasion(evasion_sig_dir);
+                    EnviarMensajeDebug((sig == EV_GIRO1) ? ((evasion_sig_dir > 0) ? "EVASION 2/8: giro a la DERECHA\r\n"
+                                                                                  : "EVASION 2/8: giro a la IZQUIERDA\r\n") :
+                                       (sig == EV_GIRO2) ? "EVASION 4/8: giro al rumbo original\r\n" :
+                                       (sig == EV_GIRO3) ? "EVASION 6/8: giro hacia la linea\r\n"
+                                                         : "EVASION 8/8: giro al rumbo original\r\n");
+                }
+                else if ((sig == EV_LATERAL) || (sig == EV_PASAR) || (sig == EV_REGRESO))
+                {
+                    IniciarTramoEvasion(sig);
+                    EnviarMensajeDebug((sig == EV_LATERAL) ? "EVASION 3/8: me aparto de la linea\r\n" :
+                                       (sig == EV_PASAR)   ? "EVASION 5/8: paso junto al obstaculo\r\n"
+                                                           : "EVASION 7/8: regreso a la linea\r\n");
+                }
+                else
+                {
+                    /* Fin de la evasion: seguir avanzando con el rumbo actual. */
+                    evasion_fase = EV_NINGUNA;
+                    estado_giro = 0U;
+                    SetForwardDirection();
+                    SetPWM(PWM_MANUAL, PWM_MANUAL);
+                    EnviarMensajeDebug("EVASION: terminada; continuo avanzando\r\n");
+                }
+            }
+            else if ((evasion_fase == EV_LATERAL) || (evasion_fase == EV_PASAR) ||
+                     (evasion_fase == EV_REGRESO))
+            {
+                float meta_tramo = (evasion_fase == EV_PASAR) ? EV_PASAR_M :
+                                   (evasion_fase == EV_REGRESO) ? EV_REGRESO_M : EV_LATERAL_M;
+                uint8_t por_tiempo = ((ahora_ev - evasion_fase_ms) >= EV_TRAMO_MAX_MS) ? 1U : 0U;
+                if ((evasion_seg_m >= meta_tramo) || (por_tiempo != 0U))
+                {
+                    /* LATERAL y PASAR giran hacia el lado contrario; REGRESO
+                     * gira hacia el lado s para quedar con el rumbo original. */
+                    int8_t dir = (evasion_fase == EV_REGRESO) ? evasion_lado
+                                                              : (int8_t)(-evasion_lado);
+                    if (por_tiempo != 0U)
+                    {
+                        EnviarMensajeDebug("EVASION_WARN: tramo terminado por tiempo (revisar encoders)\r\n");
+                    }
+                    StopMotors();
+                    if (evasion_fase == EV_LATERAL) evasion_sig_fase = EV_GIRO2;
+                    else if (evasion_fase == EV_PASAR) evasion_sig_fase = EV_GIRO3;
+                    else evasion_sig_fase = EV_GIRO4;
+                    evasion_sig_dir = dir;
+                    evasion_fase = EV_PAUSA;
+                    evasion_fase_ms = ahora_ev;
+                }
+                else
+                {
+                    PwmAvanceRecto();   /* recto con el rumbo del tramo */
+                }
+            }
+        }
+        /* Seguridad: parar si se pierde la lectura IMU o vence el tiempo. */
+        if (yaw_turn_active != 0U)
+        {
+            uint32_t now_turn = HAL_GetTick();
+            if ((now_turn - yaw_turn_last_valid_ms) > YAW_TURN_VALID_TIMEOUT_MS)
+            {
+                StopMotors();
+                yaw_turn_active = 0U;
+                if (modo_automatico != 0U) { modo_automatico = 0U; estado_giro = 0U; }
+                if (giros_fallidos < 255U) giros_fallidos++;
+                LogEscribir(LOG_TIPO_FALLO, yaw_turn_progress_deg, 0.0f);
+                EnviarMensajeDebug("YAW_TURN_ABORT: sin datos del giroscopio; motores detenidos\r\n");
+            }
+            else if ((now_turn - yaw_turn_start_ms) > YAW_TURN_TIMEOUT_MS)
+            {
+                StopMotors();
+                yaw_turn_active = 0U;
+                if (modo_automatico != 0U) { modo_automatico = 0U; estado_giro = 0U; }
+                if (giros_fallidos < 255U) giros_fallidos++;
+                LogEscribir(LOG_TIPO_FALLO, yaw_turn_progress_deg, 0.0f);
+                char timeout_msg[120];
+                int yaw_x100 = (int)(yaw_turn_progress_deg * 100.0f);
+                snprintf(timeout_msg, sizeof(timeout_msg),
+                    "YAW_TURN_TIMEOUT,progress=%d.%02d_deg,target=90.00\r\n",
+                    yaw_x100 / 100, abs(yaw_x100 % 100));
+                EnviarMensajeDebug(timeout_msg);
+            }
+        }
+        /* ========================================================== *
+           1\\. MEDICIÓN DE RPM DE AMBOS ENCODERS
+           \\========================================================== */
+        if ((HAL_GetTick() - last_rpm_time) >= RPM_SAMPLE_TIME_MS)
+        {
+            uint16_t encoder3_current;
+            uint16_t encoder4_current;
+            float dt;
+            encoder3_current = (uint16_t)__HAL_TIM_GET_COUNTER(&htim3);
+            encoder4_current = (uint16_t)__HAL_TIM_GET_COUNTER(&htim4);
+            /* Diferencia de cuentas desde la medicion anterior */
+            encoder3_delta = (int16_t)(encoder3_current - encoder3_previous);
+            encoder4_delta = (int16_t)(encoder4_current - encoder4_previous);
+            /* Para el ajuste del sesgo del giroscopio: ruedas paradas y sin PWM. */
+            if ((encoder3_delta != 0) || (encoder4_delta != 0) ||
+                (pwm_actual_izquierdo > 0.0f) || (pwm_actual_derecho > 0.0f))
+            {
+                gyro_quieto_desde_ms = HAL_GetTick();
+            }
+            dt = (HAL_GetTick() - last_rpm_time) / 1000.0f;
+            if (dt <= 0.0f)
+            {
+                dt = RPM_SAMPLE_TIME_MS / 1000.0f;
+            }
+            /* Motor derecho -> TIM3 */
+            rpm_motor_derecho =((float)encoder3_delta / ENCODER_COUNTS_PER_REV) *(60.0f / dt);
+            wheel_speed_derecho_ms =(rpm_motor_derecho * PI_VALUE * WHEEL_DIAMETER_M) / 60.0f;
+            /* Motor izquierdo -> TIM4 */
+            rpm_motor_izquierdo =((float)encoder4_delta / ENCODER_COUNTS_PER_REV) *(60.0f / dt);
+            wheel_speed_izquierdo_ms =(rpm_motor_izquierdo * PI_VALUE * WHEEL_DIAMETER_M) / 60.0f;
+            /* Calcula la distancia recorrida y la velocidad promedio */
+            {
+                float cuentas_promedio_abs =
+                    ((float)abs((int)encoder3_delta) +
+                     (float)abs((int)encoder4_delta)) / 2.0f;
+                float distancia_intervalo_m = cuentas_promedio_abs * distance_per_count;
+
+                if (estado_giro == 0U)
+                {
+                    /* El recorrido longitudinal se mide con los encoders. */
+                    encoder_distance_m += distancia_intervalo_m;
+                }
+                /* Rodeo: distancia de cada tramo recto; PASAR tambien cuenta
+                 * como avance sobre la linea (para la meta de 1 m). */
+                if ((modo_automatico != 0U) &&
+                    ((evasion_fase == EV_LATERAL) || (evasion_fase == EV_PASAR) ||
+                     (evasion_fase == EV_REGRESO)))
+                {
+                    evasion_seg_m += distancia_intervalo_m;
+                    if (evasion_fase == EV_PASAR) encoder_distance_m += distancia_intervalo_m;
+                }
+                /* Durante el giro los encoders no incrementan el objetivo lineal. */
+
+                encoder_speed_m_s = (dt > 0.0f) ?
+                                    (distancia_intervalo_m / dt) : 0.0f;
+            }
+
+            if (modo_automatico && estado_giro == 0U)
+            {
+                if (encoder_distance_m >= TARGET_DISTANCE_M)
+                {
+                    StopMotors();
+                    modo_automatico = 0U;
+                    prueba_identificacion = 0U;
+                    EnviarMensajeDebug("META: 2.50 m alcanzado; motores detenidos\r\n");
+                }
+                else
+                {
+                    SetForwardDirection();
+                    PwmAvanceRecto();
+                }
+            }
+            encoder3_previous = encoder3_current;
+            encoder4_previous = encoder4_current;
+            last_rpm_time = HAL_GetTick();
+            /* Enviar datos de los encoders. TELEMETRIA_CON_OBSTACULO = 1:
+             * tambien con obstaculo cercano (para pruebas); 0 = ocultar. */
+            if ((TELEMETRIA_CON_OBSTACULO != 0U) || (obstaculo_detectado == 0U))
+            {
+                char mensaje[512];
+                int rpm_der_x100;
+                int rpm_izq_x100;
+                int pwm_der_x10;
+                int pwm_izq_x10;
+                int enc_v_x1000;
+                int enc_d_x100;
+                /* Tiempo transcurrido desde el ultimo comando recibido. */
+                uint32_t tiempo_comando_ms = 0U;
+                if (tiempo_comando_activo != 0U)
+                {
+                    tiempo_comando_ms = HAL_GetTick() - tiempo_inicio_comando;
+                }
+                /* Se convierten los decimales a enteros para enviarlos por serial */
+                rpm_der_x100 = (int)(rpm_motor_derecho * 100.0f);
+                rpm_izq_x100 = (int)(rpm_motor_izquierdo * 100.0f);
+                pwm_der_x10 = (int)(pwm_actual_derecho * 10.0f);
+                pwm_izq_x10 = (int)(pwm_actual_izquierdo * 10.0f);
+                enc_v_x1000 = (int)(encoder_speed_m_s * 1000.0f + 0.5f);
+                enc_d_x100 = (int)(encoder_distance_m * 100.0f + 0.5f);
+                if (imuStatus == 1U)
+                {
+                    int head100 = (int)(fabsf(imu_heading_relative_deg) * 100.0f + 0.5f);
+                    char head_sign = (imu_heading_relative_deg < 0.0f) ? '-' : '+';
+                    int mx100 = (int)(imuData.mag_x_uT * 100.0f);
+                    int my100 = (int)(imuData.mag_y_uT * 100.0f);
+                    int mz100 = (int)(imuData.mag_z_uT * 100.0f);
+                    int gz10 = (int)(gyro_rate_dps * 10.0f);
+                    int yawg100 = (int)(yaw_gyro_deg * 100.0f);
+                    int yawe100 = (int)(yaw_enc_deg * 100.0f);
+                    int obj10 = (int)(rumbo_objetivo_deg * 10.0f);
+                    snprintf(mensaje, sizeof(mensaje),
+                        "DER: CNT=%u dN=%d RPM=%d.%02d PWM=%d.%d | "
+                        "IZQ: CNT=%u dN=%d RPM=%d.%02d PWM=%d.%d | "
+                        "ENC_V=%d.%03d m/s ENC_D=%d.%02d m T_MS=%lu | "
+                        "GYRO: GV=%c%d.%d dps YAW_G=%c%d.%02d deg OBJ=%c%d.%d YAW_ENC=%c%d.%02d deg | "
+                        "IMU: YAW_REL=%c%d.%02d deg MX=%d.%02d MY=%d.%02d MZ=%d.%02d uT "
+                        "RAW=%d,%d,%d MAG=%d.%02d VALID=%u\r\n",
+                        encoder3_current, encoder3_delta,
+                        rpm_der_x100 / 100, abs(rpm_der_x100 % 100),
+                        pwm_der_x10 / 10, abs(pwm_der_x10 % 10),
+                        encoder4_current, encoder4_delta,
+                        rpm_izq_x100 / 100, abs(rpm_izq_x100 % 100),
+                        pwm_izq_x10 / 10, abs(pwm_izq_x10 % 10),
+                        enc_v_x1000 / 1000, abs(enc_v_x1000 % 1000),
+                        enc_d_x100 / 100, abs(enc_d_x100 % 100),
+                        (unsigned long)tiempo_comando_ms,
+                        (gz10 < 0) ? '-' : '+', abs(gz10) / 10, abs(gz10) % 10,
+                        (yawg100 < 0) ? '-' : '+', abs(yawg100) / 100, abs(yawg100) % 100,
+                        (obj10 < 0) ? '-' : '+', abs(obj10) / 10, abs(obj10) % 10,
+                        (yawe100 < 0) ? '-' : '+', abs(yawe100) / 100, abs(yawe100) % 100,
+                        head_sign, head100 / 100, abs(head100 % 100),
+                        mx100 / 100, abs(mx100 % 100),
+                        my100 / 100, abs(my100 % 100),
+                        mz100 / 100, abs(mz100 % 100),
+                        imuData.mag_x_raw, imuData.mag_y_raw, imuData.mag_z_raw,
+                        (int)(imuData.mag_norm_uT * 100.0f) / 100,
+                        abs((int)(imuData.mag_norm_uT * 100.0f) % 100),
+                        (unsigned int)imu_mag_valid);
+                }
+                else
+                {
+                    snprintf(mensaje, sizeof(mensaje),
+                        "DER: CNT=%u dN=%d RPM=%d.%02d PWM=%d.%d | "
+                        "IZQ: CNT=%u dN=%d RPM=%d.%02d PWM=%d.%d | "
+                        "ENC_V=%d.%03d m/s ENC_D=%d.%02d m T_MS=%lu | IMU=NO_DISPONIBLE\r\n",
+                        encoder3_current, encoder3_delta,
+                        rpm_der_x100 / 100, abs(rpm_der_x100 % 100),
+                        pwm_der_x10 / 10, abs(pwm_der_x10 % 10),
+                        encoder4_current, encoder4_delta,
+                        rpm_izq_x100 / 100, abs(rpm_izq_x100 % 100),
+                        pwm_izq_x10 / 10, abs(pwm_izq_x10 % 10),
+                        enc_v_x1000 / 1000, abs(enc_v_x1000 % 1000),
+                        enc_d_x100 / 100, abs(enc_d_x100 % 100),
+                        (unsigned long)tiempo_comando_ms);
+                }
+                EnviarMensajeDebug(mensaje);
+                /* DIAGNOSTICO temporal del giroscopio (lectura directa, sin FIFO). */
+                if (gyro_ok != 0U)
+                {
+                    char diag[140];
+                    int gx = (int)(diag_gyro_dps[0] * 10.0f);
+                    int gy = (int)(diag_gyro_dps[1] * 10.0f);
+                    int gz = (int)(diag_gyro_dps[2] * 10.0f);
+                    int yd = (int)(diag_yaw_d_deg * 100.0f);
+                    snprintf(diag, sizeof(diag),
+                        "DIAG: GX_D=%c%d.%d GY_D=%c%d.%d GZ_D=%c%d.%d dps YAW_D=%c%d.%02d deg FIFO=%u\r\n",
+                        (gx < 0) ? '-' : '+', abs(gx) / 10, abs(gx) % 10,
+                        (gy < 0) ? '-' : '+', abs(gy) / 10, abs(gy) % 10,
+                        (gz < 0) ? '-' : '+', abs(gz) / 10, abs(gz) % 10,
+                        (yd < 0) ? '-' : '+', abs(yd) / 100, abs(yd) % 100,
+                        (unsigned int)diag_fifo_bytes);
+                    EnviarMensajeDebug(diag);
+                }
+                /* Datos CSV exclusivos para identificar la planta en lazo abierto. */
+                if (modo_lazo_abierto != 0U)
+                {
+                    char id_line[180];
+                    uint32_t t_id = HAL_GetTick() - tiempo_inicio_lazo_abierto;
+                    snprintf(id_line, sizeof(id_line),
+                        "ID_DATA,%lu,%.1f,%.1f,%.2f,%.2f,%.2f,%.4f\r\n",
+                        (unsigned long)t_id,
+                        pwm_actual_derecho,
+                        pwm_actual_izquierdo,
+                        rpm_motor_derecho,
+                        rpm_motor_izquierdo,
+                        imu_heading_relative_deg,
+                        encoder_distance_m);
+                    EnviarMensajeDebug(id_line);
+                }
+            }
+            /* Terminar la prueba al cumplir la duracion solicitada. */
+            if ((modo_lazo_abierto != 0U) &&
+                ((HAL_GetTick() - tiempo_inicio_lazo_abierto) >= ID_TEST_DURATION_MS))
+            {
+                StopMotors();
+                modo_lazo_abierto = 0U;
+                EnviarMensajeDebug("ID_OPEN_LOOP_END,tiempo=5000_ms,motores_detenidos\r\n");
+            }
+        }
+        /* Revisar si hay un obstaculo a 15 cm o menos */
+        if ((HAL_GetTick() - last_ultrasonic_time) >= US_SAMPLE_TIME_MS)
+        {
+            float distancia_cm;
+            last_ultrasonic_time = HAL_GetTick();
+            distancia_cm = Ultrasonic_ReadCm();
+            if (distancia_cm >= 2.0f && distancia_cm <= US_THRESHOLD_CM)
+            {
+                char mensaje_us[80];
+                obstaculo_detectado = 1U;
+
+                if ((modo_automatico != 0U) && (estado_giro == 0U) && (obstacle_latched == 0U))
+                {
+                    StopMotors();
+                    obstacle_latched = 1U;
+                    if (FuenteGiroOk() == 0U)
+                    {
+                        modo_automatico = 0U;
+                        estado_giro = 0U;
+                        EnviarMensajeDebug("EVASION_ABORTADA: fuente de giro no disponible\r\n");
+                    }
+                    else
+                    {
+                        /* Rodeo: 1) retroceder; despues giros y tramos en
+                         * la maquina de estados del lazo principal. */
+                        evasion_lado = (next_evasion_right != 0U) ? 1 : -1;
+                        next_evasion_right = (next_evasion_right != 0U) ? 0U : 1U;
+                        estado_giro = 1U;
+                        evasion_fase = EV_FRENO;          /* ya se llamo StopMotors */
+                        evasion_fase_ms = HAL_GetTick();
+                        EnviarMensajeDebug("EVASION: obstaculo; freno\r\n");
+                    }
+                }
+                else if ((modo_automatico != 0U) && (estado_giro == 0U) && (obstacle_latched != 0U))
+                {
+                    /* Obstaculo otra vez enfrente sin haberse liberado el
+                     * bloqueo (p. ej. pared tras el giro): frenar, no chocar. */
+                    StopMotors();
+                    modo_automatico = 0U;
+                    prueba_identificacion = 0U;
+                    EnviarMensajeDebug("EVASION: obstaculo persistente, parado\r\n");
+                }
+                else if ((modo_automatico != 0U) && (distancia_cm <= EV_UMBRAL_RODEO_CM) &&
+                         ((evasion_fase == EV_LATERAL) || (evasion_fase == EV_PASAR) ||
+                          (evasion_fase == EV_REGRESO)))
+                {
+                    /* Otro obstaculo en un tramo recto del rodeo: no hay
+                     * espacio para seguir; frenar en lugar de chocar. */
+                    StopMotors();
+                    modo_automatico = 0U;
+                    prueba_identificacion = 0U;
+                    estado_giro = 0U;
+                    evasion_fase = EV_NINGUNA;
+                    EnviarMensajeDebug("EVASION: obstaculo durante el rodeo, parado\r\n");
+                }
+                else if (!modo_automatico)
+                {
+                    /* En manual solo se corta el AVANCE (w o prueba I);
+                     * atras y giros siguen permitidos para poder alejarse. */
+                    if ((wasd_cmd == 'w') || (modo_lazo_abierto != 0U))
+                    {
+                        StopMotors();
+                        wasd_cmd = 0;
+                        modo_lazo_abierto = 0U;
+                        prueba_identificacion = 0U;
+                        parada_por_obstaculo = 1U;
+                    }
+                }
+
+                int distancia_x10 = (int)(distancia_cm * 10.0f + 0.5f);
+                sprintf(mensaje_us, "DISTANCIA OBJETO: %d.%d cm\r\n",
+                        distancia_x10 / 10, abs(distancia_x10 % 10));
+                EnviarMensajeDebug(mensaje_us);
+            }
+            else
+            {
+                /* Rearmar cuando el obstaculo se aleje claramente (>20 cm)
+                 * o no haya eco (nada dentro del alcance del sensor). */
+                obstaculo_detectado = 0U;
+                if ((distancia_cm < 0.0f) || (distancia_cm > (US_THRESHOLD_CM + 5.0f)))
+                {
+                    obstacle_latched = 0U;
+                }
+            }
+        }
+        /* DIAGNOSTICO temporal: mostrar que letra llego desde la ESP32. */
+        while (rx_esp_diag_tail != rx_esp_diag_head)
+        {
+            char rx_msg[40];
+            uint8_t c = rx_esp_diag[rx_esp_diag_tail];
+            rx_esp_diag_tail = (uint8_t)((rx_esp_diag_tail + 1U) % 8U);
+            snprintf(rx_msg, sizeof(rx_msg), "RX_ESP: '%c' (0x%02X)\r\n", (char)c, (unsigned int)c);
+            EnviarMensajeDebug(rx_msg);
+        }
+        /* Revisar si llego un comando (Tera Term o Bluetooth) */
+        uint32_t momento_cmd = 0U;
+        char cmd = TomarComando(&momento_cmd);
+        /* Boton azul: el STOP de emergencia tiene prioridad sobre todo. */
+        if (boton_cmd_inmediato != 0)
+        {
+            cmd = boton_cmd_inmediato;
+            boton_cmd_inmediato = 0;
+            HAL_GPIO_WritePin(GPIOA, LD2_Pin, GPIO_PIN_RESET);
+        }
+        /* Fin de la cuenta regresiva del boton: equivale a recibir 'R' o 'F'.
+         * Un comando real (p. ej. S) que llegue en ese momento tiene prioridad
+         * y cancela el boton. */
+        if (boton_armado != 0U)
+        {
+            if (cmd != 0)
+            {
+                boton_armado = 0U;
+                HAL_GPIO_WritePin(GPIOA, LD2_Pin, GPIO_PIN_RESET);
+            }
+            else if ((HAL_GetTick() - boton_armado_ms) >= BOTON_ESPERA_MS)
+            {
+                boton_armado = 0U;
+                HAL_GPIO_WritePin(GPIOA, LD2_Pin, GPIO_PIN_RESET);
+                cmd = boton_cmd;
+            }
+        }
+        /* Normalizar: q/Q = parar; W/A/D mayuscula = w/a/d.
+         * Ojo: 's' minuscula = atras, 'S' mayuscula = parar. */
+        if ((cmd == 'q') || (cmd == 'Q')) cmd = 'S';
+        else if (cmd == 'W') cmd = 'w';
+        else if (cmd == 'A') cmd = 'a';
+        else if (cmd == 'D') cmd = 'd';
+
+        if ((cmd == 'w') || (cmd == 's') || (cmd == 'a') || (cmd == 'd'))
+        {
+            /* ---- Manejo WASD: se mueve mientras llegan repeticiones ---- */
+            if ((cmd == 'w') && (obstaculo_detectado != 0U))
+            {
+                if (wasd_cmd != 0)
+                {
+                    StopMotors();
+                    wasd_cmd = 0;
+                }
+                if ((HAL_GetTick() - wasd_aviso_obstaculo_ms) >= 500U)
+                {
+                    wasd_aviso_obstaculo_ms = HAL_GetTick();
+                    EnviarMensajeDebug("WASD: OBSTACULO AL FRENTE, AVANCE BLOQUEADO\r\n");
+                }
+            }
+            else
+            {
+                if (cmd != wasd_cmd)
+                {
+                    /* Cambio de direccion: cancelar cualquier otro modo. */
+                    yaw_turn_active = 0U;
+                    estado_giro = 0U;
+                    modo_automatico = 0U;
+                    modo_lazo_abierto = 0U;
+                    prueba_identificacion = 0U;
+                    parada_por_obstaculo = 0U;
+                    tiempo_inicio_comando = HAL_GetTick();
+                    tiempo_comando_activo = 1U;
+                    if (cmd == 'w')
+                    {
+                        SetForwardDirection();
+                        EnviarMensajeDebug("WASD: ADELANTE\r\n");
+                    }
+                    else if (cmd == 's')
+                    {
+                        SetBackwardDirection();
+                        EnviarMensajeDebug("WASD: ATRAS\r\n");
+                    }
+                    else if (cmd == 'a')
+                    {
+                        SetTurnLeftDirection();
+                        EnviarMensajeDebug("WASD: IZQUIERDA\r\n");
+                    }
+                    else
+                    {
+                        SetTurnRightDirection();
+                        EnviarMensajeDebug("WASD: DERECHA\r\n");
+                    }
+                    SetPWM(PWM_MANUAL, PWM_MANUAL);
+                    wasd_cmd = cmd;
+                    wasd_repite = 0U;
+                }
+                else
+                {
+                    wasd_repite = 1U;   /* la tecla se esta autorrepitiendo */
+                }
+                wasd_ultimo_ms = momento_cmd;
+            }
+        }
+        else if (cmd != 0)
+        {
+            /* Cualquier comando especial cancela el manejo WASD. */
+            wasd_cmd = 0;
+            /* Cada comando F/R/S/I inicia una nueva referencia de T_MS. */
+            tiempo_inicio_comando = HAL_GetTick();
+            tiempo_comando_activo = 1U;
+            if (cmd == 'F')
+            {
+                yaw_turn_active = 0U;
+                /* Iniciar recorrido automatico de 1 m en lazo abierto */
+                StopMotors();
+                __HAL_TIM_SET_COUNTER(&htim3, 0U);
+                __HAL_TIM_SET_COUNTER(&htim4, 0U);
+                enc_yaw_prev3 = 0U;   /* evita un salto en yaw_enc_deg */
+                enc_yaw_prev4 = 0U;
+                encoder3_previous = 0U;
+                encoder4_previous = 0U;
+                encoder_distance_m = 0.0f;
+                encoder_speed_m_s = 0.0f;
+                rpm_motor_derecho = 0.0f;
+                rpm_motor_izquierdo = 0.0f;
+                tiempo_inicio_prueba = tiempo_inicio_comando;  /* comando F */
+                last_rpm_time = tiempo_inicio_prueba;
+                prueba_identificacion = 1U;
+                modo_automatico = 1U;
+                modo_lazo_abierto = 0U;
+                parada_por_obstaculo = 0U;
+                obstacle_latched = 0U;
+                next_evasion_right = 1U;
+                estado_giro = 0U;
+                distancia_giro_m = 0.0f;
+                SetForwardDirection();
+                SetPWM(PWM_MANUAL, PWM_MANUAL);
+                rumbo_objetivo_deg = YawFuenteDeg();   /* rumbo de salida = 0 relativo */
+                evasion_fase = EV_NINGUNA;
+                rumbo_valido = 1U;
+                EnviarMensajeDebug("INICIO LAZO ABIERTO: objetivo 2.50 m, PWM fijo=39\r\n");
+            }
+            else if ((cmd == 'B') || (cmd == 'L'))
+            {
+                /* Compatibilidad con la app/ESP32 (que no reenvia w/a/s/d):
+                 * B = atras, L = izquierda, hasta recibir S o q. */
+                yaw_turn_active = 0U;
+                estado_giro = 0U;
+                modo_automatico = 0U;
+                modo_lazo_abierto = 0U;
+                prueba_identificacion = 0U;
+                if (cmd == 'B')
+                {
+                    SetBackwardDirection();
+                    EnviarMensajeDebug("COMANDO: ATRAS - PWM FIJO 39 (parar con S)\r\n");
+                }
+                else
+                {
+                    SetTurnLeftDirection();
+                    EnviarMensajeDebug("COMANDO: IZQUIERDA - PWM FIJO 39 (parar con S)\r\n");
+                }
+                SetPWM(PWM_MANUAL, PWM_MANUAL);
+            }
+            else if (cmd == 'I')
+            {
+                yaw_turn_active = 0U;
+                estado_giro = 0U;
+                /* Identificacion en lazo abierto: PWM constante, sin control PI. */
+                StopMotors();
+                modo_automatico = 0U;
+                prueba_identificacion = 0U;
+                modo_lazo_abierto = 1U;
+                tiempo_inicio_lazo_abierto = HAL_GetTick();
+                __HAL_TIM_SET_COUNTER(&htim3, 0U);
+                __HAL_TIM_SET_COUNTER(&htim4, 0U);
+                enc_yaw_prev3 = 0U;   /* evita un salto en yaw_enc_deg */
+                enc_yaw_prev4 = 0U;
+                encoder3_previous = 0U;
+                encoder4_previous = 0U;
+                encoder_distance_m = 0.0f;
+                encoder_speed_m_s = 0.0f;
+                rpm_motor_derecho = 0.0f;
+                rpm_motor_izquierdo = 0.0f;
+                last_rpm_time = HAL_GetTick();
+                SetForwardDirection();
+                SetPWM(ID_PWM_STEP, ID_PWM_STEP);
+                EnviarMensajeDebug("ID_OPEN_LOOP_START,PWM=39,T_MS=0\r\n");
+                EnviarMensajeDebug("ID_DATA,t_ms,pwm_d,pwm_i,rpm_d,rpm_i,yaw_rel_deg,dist_m\r\n");
+            }
+            else if (cmd == 'R')
+            {
+                estado_giro = 0U;
+                modo_automatico = 0U;
+                modo_lazo_abierto = 0U;
+                prueba_identificacion = 0U;
+                StopMotors();
+
+                if (FuenteGiroOk() != 0U)
+                {
+                    yaw_turn_direction = 1;
+                    yaw_turn_progress_deg = 0.0f;
+                    yaw_turn_inicio_deg = YawFuenteDeg();
+                    giro_final_pendiente = 0U;
+                    yaw_turn_start_ms = HAL_GetTick();
+                    yaw_turn_last_valid_ms = yaw_turn_start_ms;
+                    yaw_turn_active = 1U;
+                    PrepararControlGiro();
+                    SetTurnRightDirection();
+                    SetPWM(GIRO_PWM_MAX, GIRO_PWM_MAX);
+                    EnviarMensajeDebug("YAW_TURN_START,RIGHT,target=90.00_deg\r\n");
+                }
+                else
+                {
+                    yaw_turn_active = 0U;
+                    EnviarMensajeDebug("YAW_TURN_REFUSED: fuente de giro no disponible\r\n");
+                }
+            }
+            else if (cmd == 'S')
+            {
+                yaw_turn_active = 0U;
+                estado_giro = 0U;
+                StopMotors();
+                modo_lazo_abierto = 0U;
+                modo_automatico = 0U;
+                prueba_identificacion = 0U;
+                {
+                    const char *msg = "COMANDO: STOP - fin de prueba\r\n";
+                    EnviarMensajeDebug(msg);
+                }
+            }
+        }
+        /* Hombre muerto WASD: parar si se solto la tecla. */
+        if (wasd_cmd != 0)
+        {
+            uint32_t limite_ms = (wasd_repite != 0U) ? WASD_TIMEOUT_REPETICION_MS
+                                                     : WASD_TIMEOUT_INICIAL_MS;
+            if ((HAL_GetTick() - wasd_ultimo_ms) > limite_ms)
+            {
+                StopMotors();
+                wasd_cmd = 0;
+                EnviarMensajeDebug("WASD: SOLTADO, PARADO\r\n");
+            }
+        }
+    }
+}
+/* Configuracion del reloj */
+void SystemClock_Config(void)
+{
+    RCC_OscInitTypeDef RCC_OscInitStruct = {0};
+    RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
+    __HAL_RCC_PWR_CLK_ENABLE();
+    __HAL_PWR_VOLTAGESCALING_CONFIG(PWR_REGULATOR_VOLTAGE_SCALE3);
+    RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSI;
+    RCC_OscInitStruct.HSIState = RCC_HSI_ON;
+    RCC_OscInitStruct.HSICalibrationValue = RCC_HSICALIBRATION_DEFAULT;
+    RCC_OscInitStruct.PLL.PLLState = RCC_PLL_ON;
+    RCC_OscInitStruct.PLL.PLLSource = RCC_PLLSOURCE_HSI;
+    RCC_OscInitStruct.PLL.PLLM = 16;
+    RCC_OscInitStruct.PLL.PLLN = 336;
+    RCC_OscInitStruct.PLL.PLLP = RCC_PLLP_DIV4;
+    RCC_OscInitStruct.PLL.PLLQ = 2;
+    RCC_OscInitStruct.PLL.PLLR = 2;
+    if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK)
+    {
+        Error_Handler();
+    }
+    RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_HCLK |
+                                  RCC_CLOCKTYPE_SYSCLK |
+                                  RCC_CLOCKTYPE_PCLK1 |
+                                  RCC_CLOCKTYPE_PCLK2;
+    RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_PLLCLK;
+    RCC_ClkInitStruct.AHBCLKDivider = RCC_SYSCLK_DIV1;
+    RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV2;
+    RCC_ClkInitStruct.APB2CLKDivider = RCC_HCLK_DIV1;
+    if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_2) != HAL_OK)
+    {
+        Error_Handler();
+    }
+}
+/* TIM3: encoder derecho */
+static void MX_TIM3_Init(void)
+{
+    TIM_Encoder_InitTypeDef sConfig = {0};
+    TIM_MasterConfigTypeDef sMasterConfig = {0};
+    htim3.Instance = TIM3;
+    htim3.Init.Prescaler = 0;
+    htim3.Init.CounterMode = TIM_COUNTERMODE_UP;
+    htim3.Init.Period = 65535;
+    htim3.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
+    htim3.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
+    sConfig.EncoderMode = TIM_ENCODERMODE_TI12;
+    sConfig.IC1Polarity = TIM_ICPOLARITY_RISING;
+    sConfig.IC1Selection = TIM_ICSELECTION_DIRECTTI;
+    sConfig.IC1Prescaler = TIM_ICPSC_DIV1;
+    sConfig.IC1Filter = 4;
+    sConfig.IC2Polarity = TIM_ICPOLARITY_RISING;
+    sConfig.IC2Selection = TIM_ICSELECTION_DIRECTTI;
+    sConfig.IC2Prescaler = TIM_ICPSC_DIV1;
+    sConfig.IC2Filter = 4;
+    if (HAL_TIM_Encoder_Init(&htim3, &sConfig) != HAL_OK)
+    {
+        Error_Handler();
+    }
+    sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
+    sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
+    if (HAL_TIMEx_MasterConfigSynchronization(&htim3, &sMasterConfig) != HAL_OK)
+    {
+        Error_Handler();
+    }
+}
+/* TIM4: encoder izquierdo */
+static void MX_TIM4_Init(void)
+{
+    TIM_Encoder_InitTypeDef sConfig = {0};
+    TIM_MasterConfigTypeDef sMasterConfig = {0};
+    htim4.Instance = TIM4;
+    htim4.Init.Prescaler = 0;
+    htim4.Init.CounterMode = TIM_COUNTERMODE_UP;
+    htim4.Init.Period = 65535;
+    htim4.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
+    htim4.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
+    sConfig.EncoderMode = TIM_ENCODERMODE_TI12;
+    sConfig.IC1Polarity = TIM_ICPOLARITY_RISING;
+    sConfig.IC1Selection = TIM_ICSELECTION_DIRECTTI;
+    sConfig.IC1Prescaler = TIM_ICPSC_DIV1;
+    sConfig.IC1Filter = 4;
+    sConfig.IC2Polarity = TIM_ICPOLARITY_RISING;
+    sConfig.IC2Selection = TIM_ICSELECTION_DIRECTTI;
+    sConfig.IC2Prescaler = TIM_ICPSC_DIV1;
+    sConfig.IC2Filter = 4;
+    if (HAL_TIM_Encoder_Init(&htim4, &sConfig) != HAL_OK)
+    {
+        Error_Handler();
+    }
+    sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
+    sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
+    if (HAL_TIMEx_MasterConfigSynchronization(&htim4, &sMasterConfig) != HAL_OK)
+    {
+        Error_Handler();
+    }
+}
+/* TIM5: PWM de los motores */
+static void MX_TIM5_Init(void)
+{
+    TIM_MasterConfigTypeDef sMasterConfig = {0};
+    TIM_OC_InitTypeDef sConfigOC = {0};
+    htim5.Instance = TIM5;
+    htim5.Init.Prescaler = 83;
+    htim5.Init.CounterMode = TIM_COUNTERMODE_UP;
+    htim5.Init.Period = 49;
+    htim5.Init.ClockDivision = TIM_CLOCKDIVISION_DIV2;
+    htim5.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_ENABLE;
+    if (HAL_TIM_PWM_Init(&htim5) != HAL_OK)
+    {
+        Error_Handler();
+    }
+    sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
+    sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
+    if (HAL_TIMEx_MasterConfigSynchronization(&htim5, &sMasterConfig) != HAL_OK)
+    {
+        Error_Handler();
+    }
+    sConfigOC.OCMode = TIM_OCMODE_PWM1;
+    sConfigOC.Pulse = 0;
+    sConfigOC.OCPolarity = TIM_OCPOLARITY_HIGH;
+    sConfigOC.OCFastMode = TIM_OCFAST_DISABLE;
+    if (HAL_TIM_PWM_ConfigChannel(&htim5, &sConfigOC, TIM_CHANNEL_1) != HAL_OK)
+    {
+        Error_Handler();
+    }
+    if (HAL_TIM_PWM_ConfigChannel(&htim5, &sConfigOC, TIM_CHANNEL_2) != HAL_OK)
+    {
+        Error_Handler();
+    }
+    HAL_TIM_MspPostInit(&htim5);
+}
+/* USART2 para el monitor serial */
+static void MX_USART2_UART_Init(void)
+{
+    huart2.Instance = USART2;
+    huart2.Init.BaudRate = 115200;
+    huart2.Init.WordLength = UART_WORDLENGTH_8B;
+    huart2.Init.StopBits = UART_STOPBITS_1;
+    huart2.Init.Parity = UART_PARITY_NONE;
+    huart2.Init.Mode = UART_MODE_TX_RX;
+    huart2.Init.HwFlowCtl = UART_HWCONTROL_NONE;
+    huart2.Init.OverSampling = UART_OVERSAMPLING_16;
+    if (HAL_UART_Init(&huart2) != HAL_OK)
+    {
+        Error_Handler();
+    }
+}
+/* USART3 para la ESP32 */
+static void MX_USART3_UART_Init(void)
+{
+    huart3.Instance = USART3;
+    huart3.Init.BaudRate = 115200;
+    huart3.Init.WordLength = UART_WORDLENGTH_8B;
+    huart3.Init.StopBits = UART_STOPBITS_1;
+    huart3.Init.Parity = UART_PARITY_NONE;
+    huart3.Init.Mode = UART_MODE_TX_RX;
+    huart3.Init.HwFlowCtl = UART_HWCONTROL_NONE;
+    huart3.Init.OverSampling = UART_OVERSAMPLING_16;
+    if (HAL_UART_Init(&huart3) != HAL_OK)
+    {
+        Error_Handler();
+    }
+}
+/* Configuracion de pines */
+static void MX_GPIO_Init(void)
+{
+    GPIO_InitTypeDef GPIO_InitStruct = {0};
+    __HAL_RCC_GPIOC_CLK_ENABLE();
+    __HAL_RCC_GPIOH_CLK_ENABLE();
+    __HAL_RCC_GPIOA_CLK_ENABLE();
+    __HAL_RCC_GPIOB_CLK_ENABLE();
+    HAL_GPIO_WritePin(US_TRIG_GPIO_Port, US_TRIG_Pin, GPIO_PIN_RESET);
+    GPIO_InitStruct.Pin = US_TRIG_Pin;
+    GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+    GPIO_InitStruct.Pull = GPIO_NOPULL;
+    GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+    HAL_GPIO_Init(US_TRIG_GPIO_Port, &GPIO_InitStruct);
+    GPIO_InitStruct.Pin = US_ECHO_Pin;
+    GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
+    GPIO_InitStruct.Pull = GPIO_NOPULL;
+    HAL_GPIO_Init(US_ECHO_GPIO_Port, &GPIO_InitStruct);
+    HAL_GPIO_WritePin(GPIOA,
+                      LD2_Pin | IN3_Pin | In1_Pin | IN4_Pin,
+                      GPIO_PIN_RESET);
+    HAL_GPIO_WritePin(IN2_GPIO_Port, IN2_Pin, GPIO_PIN_RESET);
+    GPIO_InitStruct.Pin = B1_Pin;
+    GPIO_InitStruct.Mode = GPIO_MODE_IT_FALLING;
+    GPIO_InitStruct.Pull = GPIO_NOPULL;
+    HAL_GPIO_Init(B1_GPIO_Port, &GPIO_InitStruct);
+    GPIO_InitStruct.Pin = LD2_Pin | IN3_Pin | In1_Pin | IN4_Pin;
+    GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+    GPIO_InitStruct.Pull = GPIO_NOPULL;
+    GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+    HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
+    GPIO_InitStruct.Pin = IN2_Pin;
+    GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+    GPIO_InitStruct.Pull = GPIO_NOPULL;
+    GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+    HAL_GPIO_Init(IN2_GPIO_Port, &GPIO_InitStruct);
+}
+void Error_Handler(void)
+{
+    __disable_irq();
+    while (1)
+    {
+    }
+}
+#ifdef USE_FULL_ASSERT
+void assert_failed(uint8_t *file, uint32_t line)
+{
+    (void)file;
+    (void)line;
+}
+#endif
