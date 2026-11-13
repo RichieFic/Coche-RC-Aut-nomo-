@@ -106,6 +106,10 @@ Las constantes están al inicio de `main.c`. Las más usadas:
 | `RECTO_KP` | Fuerza de la corrección de rumbo al avanzar |
 | `GIRO_PWM_MAX`, `GIRO_PWM_MIN`, `GIRO_TOL_DEG` | Velocidad y tolerancia de los giros |
 | `GIRO_EQUILIBRAR_ENC` | Equilibrio de las ruedas con los encoders durante el giro |
+| `TX_NO_BLOQUEANTE` | `1` = la telemetría sale por interrupción sin detener el lazo; `0` = envío bloqueante original |
+| `US_NO_BLOQUEANTE` | `1` = el eco del ultrasónico se mide por interrupción; `0` = lectura bloqueante original |
+
+La etiqueta de git `probado-2026-11-12` marca el último firmware validado en el carro. Los cambios posteriores (telemetría y ultrasónico sin bloqueo, pull-ups en los encoders) compilan pero están pendientes de probar en hardware.
 
 ## Compilar y cargar
 

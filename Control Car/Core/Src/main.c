@@ -37,7 +37,30 @@
 #define US_ECHO_GPIO_Port             GPIOB
 #define US_ECHO_Pin                   GPIO_PIN_1
 #define US_THRESHOLD_CM               25.0f   /* frenar con margen (antes 15) */
-#define US_SAMPLE_TIME_MS             60U     /* medir mas seguido (antes 150) */
+#define US_SAMPLE_TIME_MS             70U     /* el HC-SR04 necesita >= 60 ms entre disparos */
+/* 1 = el eco se mide por interrupcion (EXTI1 en PB1) sin detener el lazo;
+ * 0 = lectura bloqueante original (hasta ~50 ms por medicion). */
+#define US_NO_BLOQUEANTE              1U
+#define US_ESPERA_MAX_MS              40U     /* sin eco en este tiempo = -1 */
+volatile uint32_t us_t_sube = 0U;             /* DWT->CYCCNT en el flanco de subida */
+volatile uint32_t us_t_baja = 0U;
+volatile uint8_t us_flancos = 0U;             /* 0 espera subida, 1 espera bajada, 2 listo */
+uint8_t us_midiendo = 0U;
+uint32_t us_inicio_ms = 0U;
+/* 1 = la telemetria se encola y sale por interrupcion (no detiene el lazo);
+ * 0 = HAL_UART_Transmit bloqueante original. */
+#define TX_NO_BLOQUEANTE              1U
+#define TX_BUF_TAM                    2048U
+#define TX_TROZO_MAX                  256U
+typedef struct
+{
+    uint8_t buf[TX_BUF_TAM];
+    volatile uint16_t head;                   /* escribe el lazo principal */
+    volatile uint16_t tail;                   /* avanza la interrupcion */
+    volatile uint16_t enviando;               /* bytes del trozo en curso (0 = libre) */
+} ColaTx_t;
+ColaTx_t cola_tx[2];                          /* 0 = USART2 (Tera Term), 1 = USART3 (ESP32) */
+volatile uint32_t tx_descartados = 0U;        /* mensajes que no cupieron en la cola */
 #define US_TIMEOUT_US                 25000U
 /* Variables globales */
 TIM_HandleTypeDef htim3;
@@ -346,7 +369,9 @@ static void StopMotors(void);
 static void EnviarMensajeDebug(const char *mensaje);
 static void DWT_Delay_Init(void);
 static void DWT_Delay_us(uint32_t us);
+#if (US_NO_BLOQUEANTE == 0U)
 static float Ultrasonic_ReadCm(void);
+#endif
 static void ReportarGPS(void);
 /* USER CODE BEGIN 0 ------------------------------------------------------- */
 /* Escribe grados*1e7 como texto con signo, p. ej. "+19.4326077". */
@@ -549,11 +574,68 @@ static void ReportarGPS(void)
     }
 }
 /* Envia el mensaje al monitor y a la ESP32 */
+#if (TX_NO_BLOQUEANTE != 0U)
+/* Lanza el siguiente trozo contiguo de la cola. Llamar con las interrupciones
+ * deshabilitadas o desde la interrupcion de la UART. */
+static void ColaTxArrancar(ColaTx_t *c, UART_HandleTypeDef *h)
+{
+    uint16_t n;
+    if ((c->enviando != 0U) || (c->head == c->tail)) return;
+    n = (c->head >= c->tail) ? (uint16_t)(c->head - c->tail)
+                             : (uint16_t)(TX_BUF_TAM - c->tail);
+    if (n > TX_TROZO_MAX) n = TX_TROZO_MAX;
+    c->enviando = n;
+    if (HAL_UART_Transmit_IT(h, &c->buf[c->tail], n) != HAL_OK)
+    {
+        c->enviando = 0U;   /* se reintenta con el siguiente mensaje */
+    }
+}
+static void ColaTxPoner(ColaTx_t *c, UART_HandleTypeDef *h, const char *m, uint16_t len)
+{
+    uint16_t head;
+    uint16_t libre;
+    uint16_t i;
+
+    __disable_irq();
+    head = c->head;
+    libre = (uint16_t)((c->tail + TX_BUF_TAM - head - 1U) % TX_BUF_TAM);
+    __enable_irq();
+    if (len > libre)
+    {
+        tx_descartados++;   /* cola llena: se descarta el mensaje completo */
+        return;
+    }
+    for (i = 0U; i < len; i++)
+    {
+        c->buf[head] = (uint8_t)m[i];
+        head = (uint16_t)((head + 1U) % TX_BUF_TAM);
+    }
+    __disable_irq();
+    c->head = head;
+    ColaTxArrancar(c, h);
+    __enable_irq();
+}
+void HAL_UART_TxCpltCallback(UART_HandleTypeDef *huart)
+{
+    ColaTx_t *c;
+    if (huart->Instance == USART2) c = &cola_tx[0];
+    else if (huart->Instance == USART3) c = &cola_tx[1];
+    else return;
+    c->tail = (uint16_t)((c->tail + c->enviando) % TX_BUF_TAM);
+    c->enviando = 0U;
+    ColaTxArrancar(c, huart);
+}
+#endif
 static void EnviarMensajeDebug(const char *mensaje)
 {
     uint16_t longitud = (uint16_t)strlen(mensaje);
+#if (TX_NO_BLOQUEANTE != 0U)
+    ColaTxPoner(&cola_tx[0], &huart2, mensaje, longitud);
+    ColaTxPoner(&cola_tx[1], &huart3, mensaje, longitud);
+#else
     HAL_UART_Transmit(&huart2, (uint8_t *)mensaje, longitud, 100);
     HAL_UART_Transmit(&huart3, (uint8_t *)mensaje, longitud, 100);
+#endif
 }
 /* Prepara el contador para medir microsegundos */
 static void DWT_Delay_Init(void)
@@ -568,7 +650,8 @@ static void DWT_Delay_us(uint32_t us)
     uint32_t ticks = (SystemCoreClock / 1000000U) * us;
     while ((DWT->CYCCNT - start) < ticks) { }
 }
-/* Mide la distancia. Si no recibe eco regresa -1 */
+#if (US_NO_BLOQUEANTE == 0U)
+/* Mide la distancia (bloqueante). Si no recibe eco regresa -1 */
 static float Ultrasonic_ReadCm(void)
 {
     uint32_t startTicks;
@@ -595,6 +678,68 @@ static float Ultrasonic_ReadCm(void)
     /* ticks -> microsegundos; distancia = duración(us) * 0.0343 / 2 */
     return (((float)pulseTicks * 1000000.0f) / (float)SystemCoreClock) * 0.01715f;
 }
+#endif
+#if (US_NO_BLOQUEANTE != 0U)
+/* PB1 (ECHO) como interrupcion en ambos flancos. Llamar despues de MX_GPIO_Init. */
+static void Ultrasonic_ConfigurarEXTI(void)
+{
+    GPIO_InitTypeDef gpio = {0};
+    gpio.Pin = US_ECHO_Pin;
+    gpio.Mode = GPIO_MODE_IT_RISING_FALLING;
+    gpio.Pull = GPIO_NOPULL;
+    HAL_GPIO_Init(US_ECHO_GPIO_Port, &gpio);
+    HAL_NVIC_SetPriority(EXTI1_IRQn, 0, 0);
+    HAL_NVIC_EnableIRQ(EXTI1_IRQn);
+}
+/* Manda el pulso de disparo (10 us) y regresa de inmediato. */
+static void Ultrasonic_Disparar(void)
+{
+    us_flancos = 0U;
+    HAL_GPIO_WritePin(US_TRIG_GPIO_Port, US_TRIG_Pin, GPIO_PIN_RESET);
+    DWT_Delay_us(3U);
+    HAL_GPIO_WritePin(US_TRIG_GPIO_Port, US_TRIG_Pin, GPIO_PIN_SET);
+    DWT_Delay_us(10U);
+    HAL_GPIO_WritePin(US_TRIG_GPIO_Port, US_TRIG_Pin, GPIO_PIN_RESET);
+    us_midiendo = 1U;
+    us_inicio_ms = HAL_GetTick();
+}
+/* Regresa 1 cuando termino la medicion en curso; *cm = distancia o -1 sin eco. */
+static uint8_t Ultrasonic_Listo(float *cm)
+{
+    if (us_midiendo == 0U) return 0U;
+    if (us_flancos == 2U)
+    {
+        uint32_t ticks = us_t_baja - us_t_sube;
+        float us = ((float)ticks * 1000000.0f) / (float)SystemCoreClock;
+        *cm = (us > (float)US_TIMEOUT_US) ? -1.0f : (us * 0.01715f);
+        us_midiendo = 0U;
+        return 1U;
+    }
+    if ((HAL_GetTick() - us_inicio_ms) >= US_ESPERA_MAX_MS)
+    {
+        *cm = -1.0f;
+        us_midiendo = 0U;
+        return 1U;
+    }
+    return 0U;
+}
+void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
+{
+    if (GPIO_Pin == US_ECHO_Pin)
+    {
+        uint32_t t = DWT->CYCCNT;
+        if (HAL_GPIO_ReadPin(US_ECHO_GPIO_Port, US_ECHO_Pin) == GPIO_PIN_SET)
+        {
+            if (us_flancos == 0U) { us_t_sube = t; us_flancos = 1U; }
+        }
+        else if (us_flancos == 1U)
+        {
+            us_t_baja = t;
+            us_flancos = 2U;
+        }
+    }
+}
+#endif
 static void SetPWM(float pwm_left, float pwm_right)
 {
     if (pwm_left < 0.0f) pwm_left = 0.0f;
@@ -948,6 +1093,9 @@ int main(void)
     MX_TIM5_Init();
     MX_I2C1_Init();
     DWT_Delay_Init();
+#if (US_NO_BLOQUEANTE != 0U)
+    Ultrasonic_ConfigurarEXTI();
+#endif
     ReportarCausaReset();
     /* Registro de giros en flash: mostrar lo guardado y marcar este arranque. */
     LogIniciar();
@@ -1747,11 +1895,27 @@ int main(void)
             }
         }
         /* Revisar si hay un obstaculo a 15 cm o menos */
+        {
+        float distancia_cm = -1.0f;
+        uint8_t us_hay_medida = 0U;
+#if (US_NO_BLOQUEANTE != 0U)
+        if ((us_midiendo == 0U) &&
+            ((HAL_GetTick() - last_ultrasonic_time) >= US_SAMPLE_TIME_MS))
+        {
+            last_ultrasonic_time = HAL_GetTick();
+            Ultrasonic_Disparar();
+        }
+        us_hay_medida = Ultrasonic_Listo(&distancia_cm);
+#else
         if ((HAL_GetTick() - last_ultrasonic_time) >= US_SAMPLE_TIME_MS)
         {
-            float distancia_cm;
             last_ultrasonic_time = HAL_GetTick();
             distancia_cm = Ultrasonic_ReadCm();
+            us_hay_medida = 1U;
+        }
+#endif
+        if (us_hay_medida != 0U)
+        {
             if (distancia_cm >= 2.0f && distancia_cm <= US_THRESHOLD_CM)
             {
                 char mensaje_us[80];
@@ -1831,7 +1995,8 @@ int main(void)
                 }
             }
         }
-        /* DIAGNOSTICO temporal: mostrar que letra llego desde la ESP32. */
+        }
+        /* DIAGNOSTICO: mostrar que letra llego desde la ESP32. */
         while (rx_esp_diag_tail != rx_esp_diag_head)
         {
             char rx_msg[40];
@@ -2128,11 +2293,11 @@ static void MX_TIM3_Init(void)
     sConfig.IC1Polarity = TIM_ICPOLARITY_RISING;
     sConfig.IC1Selection = TIM_ICSELECTION_DIRECTTI;
     sConfig.IC1Prescaler = TIM_ICPSC_DIV1;
-    sConfig.IC1Filter = 4;
+    sConfig.IC1Filter = 8;   /* mas filtro contra ruido (antes 4) */
     sConfig.IC2Polarity = TIM_ICPOLARITY_RISING;
     sConfig.IC2Selection = TIM_ICSELECTION_DIRECTTI;
     sConfig.IC2Prescaler = TIM_ICPSC_DIV1;
-    sConfig.IC2Filter = 4;
+    sConfig.IC2Filter = 8;
     if (HAL_TIM_Encoder_Init(&htim3, &sConfig) != HAL_OK)
     {
         Error_Handler();
@@ -2159,11 +2324,11 @@ static void MX_TIM4_Init(void)
     sConfig.IC1Polarity = TIM_ICPOLARITY_RISING;
     sConfig.IC1Selection = TIM_ICSELECTION_DIRECTTI;
     sConfig.IC1Prescaler = TIM_ICPSC_DIV1;
-    sConfig.IC1Filter = 4;
+    sConfig.IC1Filter = 8;   /* mas filtro contra ruido (antes 4) */
     sConfig.IC2Polarity = TIM_ICPOLARITY_RISING;
     sConfig.IC2Selection = TIM_ICSELECTION_DIRECTTI;
     sConfig.IC2Prescaler = TIM_ICPSC_DIV1;
-    sConfig.IC2Filter = 4;
+    sConfig.IC2Filter = 8;
     if (HAL_TIM_Encoder_Init(&htim4, &sConfig) != HAL_OK)
     {
         Error_Handler();

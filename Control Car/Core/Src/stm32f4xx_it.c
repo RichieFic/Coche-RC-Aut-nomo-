@@ -265,4 +265,13 @@ void UART5_IRQHandler(void)
 {
   GPS_UART_IRQHandler();
 }
+
+/**
+  * @brief EXTI1: eco del sensor ultrasonico (PB1). Ver HAL_GPIO_EXTI_Callback en main.c.
+  */
+void EXTI1_IRQHandler(void);
+void EXTI1_IRQHandler(void)
+{
+  HAL_GPIO_EXTI_IRQHandler(GPIO_PIN_1);
+}
 /* USER CODE END 1 */
