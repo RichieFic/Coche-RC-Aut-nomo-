@@ -19,7 +19,8 @@ Firmware de un carro autónomo de tracción diferencial basado en una **NUCLEO-F
 | `Control Car/Core/Src/main.c` | Lógica principal: comandos, giros, evasión y telemetría |
 | `Control Car/Core/Src/MPU9250.c` | Giroscopio, acelerómetro y magnetómetro |
 | `Control Car/Core/Src/gps_neo6m.c` | Driver del GPS NEO-6M |
-| `ESP32_Puente_BT/` | Sketch de Arduino: puente Bluetooth–UART para la ESP32 |
+| `ESP32_Puente_BT/` | Sketch de Arduino: puente Bluetooth–UART para la ESP32 (deja pasar `w a s d q` y `G`; pendiente de probar) |
+| `ESP32_Original/` | Sketch original de la ESP32, que solo reenvía `F B L R S I` |
 
 ## Hardware
 
