@@ -19,8 +19,6 @@
 #define PI_VALUE                     3.14159265f
 #define WHEEL_DIAMETER_M             0.068f
 #define TRACK_WIDTH_M                 0.172f   /* medido en CAD (centro a centro) */
-#define TURN_DISTANCE_M               (PI_VALUE * TRACK_WIDTH_M / 4.0f)
-#define LATERAL_DISTANCE_M            0.10f
 /* Tiempo entre mediciones */
 #define RPM_SAMPLE_TIME_MS           100U
 /* PWM fijo para los motores */
@@ -30,7 +28,6 @@
 #define ID_TEST_DURATION_MS          5000U
 /* Control automatico: valores iniciales para validar en el carro */
 #define TARGET_DISTANCE_M            2.50f
-#define BRAKE_DISTANCE_M             0.15f
 /* Pines del sensor ultrasonico. ECHO necesita divisor de voltaje. */
 #define US_TRIG_GPIO_Port             GPIOB
 #define US_TRIG_Pin                   GPIO_PIN_0
@@ -116,11 +113,9 @@ uint32_t tiempo_inicio_comando = 0U;
 uint8_t tiempo_comando_activo = 0U;
 /* Control automatico de distancia */
 volatile uint8_t modo_automatico = 0U;
-float distancia_inicio_m = 0.0f;
 uint8_t parada_por_obstaculo = 0U;
 uint8_t obstacle_latched = 0U; /* evita reactivar el mismo obstaculo mientras sigue enfrente */
 uint8_t estado_giro = 0U;
-float distancia_giro_m = 0.0f;
 /* MPU-9250 / magnetometro AK8963 */
 MPU9250_Data_t imuData;
 uint8_t imuStatus = 0U;
@@ -213,10 +208,6 @@ uint32_t boton_presion_ms = 0U;
 uint8_t boton_ignorar_soltar = 0U;     /* la presion fue un STOP */
 char boton_cmd = 0;                    /* 'R' o 'F' al terminar la cuenta */
 char boton_cmd_inmediato = 0;          /* 'S' de emergencia */
-/* Ultimos GIRO_FINAL guardados para leerlos despues por USB. */
-#define ULT_GIROS_N            5U
-float ult_giros_deg[ULT_GIROS_N];
-uint8_t ult_giros_cuenta = 0U;         /* total registrados (satura en 255) */
 uint8_t giros_fallidos = 0U;           /* ERROR / ABORT / TIMEOUT */
 float giro_vel_al_frenar = 0.0f;       /* dps al mandar parar (para ajustar el anticipo) */
 /* Modo F: rumbo absoluto. Al iniciar F se guarda el rumbo de salida y cada
@@ -374,6 +365,15 @@ static float Ultrasonic_ReadCm(void);
 #endif
 static void ReportarGPS(void);
 /* USER CODE BEGIN 0 ------------------------------------------------------- */
+/* Escribe un float con 'dec' decimales (1 a 4) sin usar %f, p. ej. "-12.34". */
+static void FormatearFijo(char *buf, size_t len, float valor, uint8_t dec)
+{
+    static const long escala[5] = {1L, 10L, 100L, 1000L, 10000L};
+    long e = escala[(dec > 4U) ? 4U : dec];
+    long v = (long)((valor < 0.0f) ? ((valor * (float)e) - 0.5f) : ((valor * (float)e) + 0.5f));
+    long a = (v < 0L) ? -v : v;
+    snprintf(buf, len, "%s%ld.%0*ld", (v < 0L) ? "-" : "", a / e, (int)dec, a % e);
+}
 /* Escribe grados*1e7 como texto con signo, p. ej. "+19.4326077". */
 static void FormatearGrados(char *buf, size_t len, int32_t valor_e7)
 {
@@ -1439,10 +1439,14 @@ int main(void)
                     gyro_rate_dps = GYRO_Z_SIGNO * ultima_dps;
                     gyro_last_ok_ms = now_gyro;
                     /* Con las ruedas paradas, ajustar lentamente el sesgo. */
-                    if (((now_gyro - gyro_quieto_desde_ms) >= GYRO_ZUPT_QUIETO_MS) &&
-                        (fabsf(ultima_dps) < GYRO_ZUPT_MAX_DPS))
                     {
-                        gyro_bias_dps += GYRO_ZUPT_ALFA * ultima_dps;
+                        /* Promedio de las muestras de esta lectura (menos ruido). */
+                        float media_dps = (suma_grados * MPU9250_GYRO_RATE_HZ) / (float)muestras;
+                        if (((now_gyro - gyro_quieto_desde_ms) >= GYRO_ZUPT_QUIETO_MS) &&
+                            (fabsf(media_dps) < GYRO_ZUPT_MAX_DPS))
+                        {
+                            gyro_bias_dps += GYRO_ZUPT_ALFA * media_dps;
+                        }
                     }
                 }
                 else if (st_gyro == HAL_BUSY)
@@ -1570,8 +1574,6 @@ int main(void)
                               (-(YawFuenteDeg() - yaw_turn_inicio_deg));
             int final_x100 = (int)(final_deg * 100.0f);
             giro_final_pendiente = 0U;
-            ult_giros_deg[ult_giros_cuenta % ULT_GIROS_N] = final_deg;
-            if (ult_giros_cuenta < 255U) ult_giros_cuenta++;
             LogEscribir(LOG_TIPO_OK, final_deg, giro_vel_al_frenar);
             snprintf(final_msg, sizeof(final_msg),
                      "GIRO_FINAL=%s%d.%02d deg (objetivo 90; ajustar GIRO_ANTICIPO_S / ENC_GIRO_ESCALA)\r\n",
@@ -1873,15 +1875,15 @@ int main(void)
                 {
                     char id_line[180];
                     uint32_t t_id = HAL_GetTick() - tiempo_inicio_lazo_abierto;
-                    snprintf(id_line, sizeof(id_line),
-                        "ID_DATA,%lu,%.1f,%.1f,%.2f,%.2f,%.2f,%.4f\r\n",
-                        (unsigned long)t_id,
-                        pwm_actual_derecho,
-                        pwm_actual_izquierdo,
-                        rpm_motor_derecho,
-                        rpm_motor_izquierdo,
-                        imu_heading_relative_deg,
-                        encoder_distance_m);
+                    char t_pd[12], t_pi[12], t_rd[14], t_ri[14], t_yaw[14], t_dist[14];
+                    FormatearFijo(t_pd, sizeof(t_pd), pwm_actual_derecho, 1U);
+                    FormatearFijo(t_pi, sizeof(t_pi), pwm_actual_izquierdo, 1U);
+                    FormatearFijo(t_rd, sizeof(t_rd), rpm_motor_derecho, 2U);
+                    FormatearFijo(t_ri, sizeof(t_ri), rpm_motor_izquierdo, 2U);
+                    FormatearFijo(t_yaw, sizeof(t_yaw), yaw_gyro_deg, 2U);
+                    FormatearFijo(t_dist, sizeof(t_dist), encoder_distance_m, 4U);
+                    snprintf(id_line, sizeof(id_line), "ID_DATA,%lu,%s,%s,%s,%s,%s,%s\r\n",
+                        (unsigned long)t_id, t_pd, t_pi, t_rd, t_ri, t_yaw, t_dist);
                     EnviarMensajeDebug(id_line);
                 }
             }
@@ -2138,7 +2140,6 @@ int main(void)
                 obstacle_latched = 0U;
                 next_evasion_right = 1U;
                 estado_giro = 0U;
-                distancia_giro_m = 0.0f;
                 SetForwardDirection();
                 SetPWM(PWM_MANUAL, PWM_MANUAL);
                 rumbo_objetivo_deg = YawFuenteDeg();   /* rumbo de salida = 0 relativo */
@@ -2191,7 +2192,7 @@ int main(void)
                 SetForwardDirection();
                 SetPWM(ID_PWM_STEP, ID_PWM_STEP);
                 EnviarMensajeDebug("ID_OPEN_LOOP_START,PWM=39,T_MS=0\r\n");
-                EnviarMensajeDebug("ID_DATA,t_ms,pwm_d,pwm_i,rpm_d,rpm_i,yaw_rel_deg,dist_m\r\n");
+                EnviarMensajeDebug("ID_DATA,t_ms,pwm_d,pwm_i,rpm_d,rpm_i,yaw_gyro_deg,dist_m\r\n");
             }
             else if (cmd == 'R')
             {
