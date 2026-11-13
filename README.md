@@ -15,12 +15,14 @@ Firmware de un carro autónomo de tracción diferencial basado en una **NUCLEO-F
 
 | Carpeta | Contenido |
 |---|---|
-| `Control Car/` | Proyecto de STM32CubeIDE con el firmware |
-| `Control Car/Core/Src/main.c` | Lógica principal: comandos, giros, evasión y telemetría |
-| `Control Car/Core/Src/MPU9250.c` | Giroscopio, acelerómetro y magnetómetro |
-| `Control Car/Core/Src/gps_neo6m.c` | Driver del GPS NEO-6M |
-| `ESP32_Puente_BT/` | Sketch de Arduino: puente Bluetooth–UART para la ESP32 (deja pasar `w a s d q` y `G`; pendiente de probar) |
-| `ESP32_Original/` | Sketch original de la ESP32, que solo reenvía `F B L R S I` |
+| `IDE/Control Car/Control Car/` | Proyecto de STM32CubeIDE con el firmware |
+| `IDE/Control Car/Control Car/Core/Src/main.c` | Lógica principal: comandos, giros, evasión y telemetría |
+| `IDE/Control Car/Control Car/Core/Src/MPU9250.c` | Giroscopio, acelerómetro y magnetómetro |
+| `IDE/Control Car/Control Car/Core/Src/gps_neo6m.c` | Driver del GPS NEO-6M |
+| `IDE/Control Car/ESP32_Puente_BT/` | Sketch de Arduino: puente Bluetooth–UART para la ESP32 (deja pasar `w a s d q` y `G`; pendiente de probar) |
+| `IDE/Control Car/ESP32_Original/` | Sketch original de la ESP32, que solo reenvía `F B L R S I` |
+| `Richie's version/` | CAD en SolidWorks: ensamble principal, piezas impresas, `STL/` para imprimir y `COTS/` con modelos de componentes comerciales |
+| `GG´s version/` | CAD en SolidWorks de otra versión del chasis |
 
 ## Hardware
 
@@ -114,7 +116,7 @@ La etiqueta de git `probado-2026-11-12` marca el último firmware validado en el
 
 ## Compilar y cargar
 
-1. Abre la carpeta `Control Car/` como proyecto en STM32CubeIDE.
+1. Abre la carpeta `IDE/Control Car/Control Car/` como proyecto en STM32CubeIDE.
 2. Compila con **Build** y carga con **Run**.
 
 **No regeneres el código con CubeMX:** `main.c` tiene inicializaciones escritas a mano fuera de los bloques `USER CODE` y se perderían.
@@ -133,4 +135,10 @@ Por el monitor serie (115200 baud) el firmware reporta:
 
 - Probar el GPS NEO-6M en hardware.
 - Calibración del magnetómetro y navegación por puntos GPS.
-- Estabilizar la conexión Bluetooth de la ESP32.
+- Cargar en la ESP32 el sketch corregido para manejar con WASD por Bluetooth.
+
+## Bluetooth en Windows
+
+La ESP32 aparece como **ESP32-S-MCRP**, y Windows le asigna un puerto COM de Bluetooth. La conexión solo se mantiene mientras un programa, como Tera Term, tiene ese puerto abierto. Si te conectas desde la configuración de Bluetooth de Windows, se desconecta sola a los pocos segundos; es normal.
+
+Para subirle código a la ESP32 por USB hace falta el driver **CP210x** de Silicon Labs.
