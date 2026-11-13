@@ -19,7 +19,7 @@ Firmware de un carro autónomo de tracción diferencial basado en una **NUCLEO-F
 | `IDE/Control Car/Control Car/Core/Src/main.c` | Lógica principal: comandos, giros, evasión y telemetría |
 | `IDE/Control Car/Control Car/Core/Src/MPU9250.c` | Giroscopio, acelerómetro y magnetómetro |
 | `IDE/Control Car/Control Car/Core/Src/gps_neo6m.c` | Driver del GPS NEO-6M |
-| `IDE/Control Car/ESP32_Puente_BT/` | Sketch de Arduino: puente Bluetooth–UART para la ESP32 (deja pasar `w a s d q` y `G`; pendiente de probar) |
+| `IDE/Control Car/ESP32_Puente_BT/` | Sketch de Arduino: puente Bluetooth–UART para la ESP32 (deja pasar `w a s d q` y `G`). Es el que tiene cargado la ESP32 |
 | `IDE/Control Car/ESP32_Original/` | Sketch original de la ESP32, que solo reenvía `F B L R S I` |
 | `Richie's version/` | CAD en SolidWorks: ensamble principal, piezas impresas, `STL/` para imprimir y `COTS/` con modelos de componentes comerciales |
 | `GG´s version/` | CAD en SolidWorks de otra versión del chasis |
@@ -135,7 +135,6 @@ Por el monitor serie (115200 baud) el firmware reporta:
 
 - Probar el GPS NEO-6M en hardware.
 - Calibración del magnetómetro y navegación por puntos GPS.
-- Cargar en la ESP32 el sketch corregido para manejar con WASD por Bluetooth.
 
 ## Bluetooth en Windows
 
