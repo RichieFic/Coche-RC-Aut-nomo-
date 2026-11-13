@@ -33,7 +33,8 @@
 #define US_TRIG_Pin                   GPIO_PIN_0
 #define US_ECHO_GPIO_Port             GPIOB
 #define US_ECHO_Pin                   GPIO_PIN_1
-#define US_THRESHOLD_CM               25.0f   /* frenar con margen (antes 15) */
+#define US_THRESHOLD_CM               25.0f   /* modo automatico: frenar con margen (antes 15) */
+#define US_THRESHOLD_MANUAL_CM        12.0f   /* manejo manual: bloquear 'w' solo si esta muy cerca */
 #define US_SAMPLE_TIME_MS             70U     /* el HC-SR04 necesita >= 60 ms entre disparos */
 /* 1 = el eco se mide por interrupcion (EXTI1 en PB1) sin detener el lazo;
  * 0 = lectura bloqueante original (hasta ~50 ms por medicion). */
@@ -75,6 +76,7 @@ volatile uint32_t uart_ultimo_byte_ms[2] = {0U, 0U};
 volatile char uart_cmd_candidato[2] = {0, 0};
 volatile uint32_t uart_cmd_candidato_ms[2] = {0U, 0U};
 volatile uint32_t uart_rx_errores = 0U;
+volatile uint8_t uart_ultimo_dato[2] = {0U, 0U};   /* ultimo byte recibido por cada UART */
 /* DIAGNOSTICO temporal: letras sueltas recibidas por la ESP32 (USART3). */
 volatile uint8_t rx_esp_diag[8];
 volatile uint8_t rx_esp_diag_head = 0U;
@@ -1015,6 +1017,15 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
             uart_cmd_candidato[idx] = (char)dato;
             uart_cmd_candidato_ms[idx] = ahora;
         }
+        else if (((dato == 'w') || (dato == 'a') || (dato == 's') || (dato == 'd')) &&
+                 (dato == uart_ultimo_dato[idx]))
+        {
+            /* Tecla WASD mantenida: por Bluetooth las repeticiones llegan
+             * juntas ("www"). La misma letra repetida no es texto, es la
+             * misma tecla: se toma como un solo comando. */
+            uart_cmd_candidato[idx] = (char)dato;
+            uart_cmd_candidato_ms[idx] = ahora;
+        }
         else
         {
             uart_cmd_candidato[idx] = 0;   /* letra pegada a otro texto */
@@ -1025,6 +1036,7 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
         uart_cmd_candidato[idx] = 0;       /* llego texto: no era comando */
     }
     uart_ultimo_byte_ms[idx] = ahora;
+    uart_ultimo_dato[idx] = dato;
 
     if (idx == 0U)
     {
@@ -1286,6 +1298,7 @@ int main(void)
     last_rpm_time = HAL_GetTick();
     uint32_t last_ultrasonic_time = HAL_GetTick();
     uint8_t obstaculo_detectado = 0U;
+    uint8_t obstaculo_manual = 0U;     /* algo a US_THRESHOLD_MANUAL_CM o menos */
     {
         char mensaje_inicio[] =
                 "\r\nCarro listo\r\n"
@@ -1918,6 +1931,7 @@ int main(void)
 #endif
         if (us_hay_medida != 0U)
         {
+            obstaculo_manual = ((distancia_cm >= 2.0f) && (distancia_cm <= US_THRESHOLD_MANUAL_CM)) ? 1U : 0U;
             if (distancia_cm >= 2.0f && distancia_cm <= US_THRESHOLD_CM)
             {
                 char mensaje_us[80];
@@ -1969,9 +1983,11 @@ int main(void)
                 }
                 else if (!modo_automatico)
                 {
-                    /* En manual solo se corta el AVANCE (w o prueba I);
+                    /* En manual solo se corta el AVANCE (w o prueba I), y solo si
+                     * el obstaculo esta a US_THRESHOLD_MANUAL_CM o menos;
                      * atras y giros siguen permitidos para poder alejarse. */
-                    if ((wasd_cmd == 'w') || (modo_lazo_abierto != 0U))
+                    if ((obstaculo_manual != 0U) &&
+                        ((wasd_cmd == 'w') || (modo_lazo_abierto != 0U)))
                     {
                         StopMotors();
                         wasd_cmd = 0;
@@ -2052,7 +2068,7 @@ int main(void)
         if ((cmd == 'w') || (cmd == 's') || (cmd == 'a') || (cmd == 'd'))
         {
             /* ---- Manejo WASD: se mueve mientras llegan repeticiones ---- */
-            if ((cmd == 'w') && (obstaculo_detectado != 0U))
+            if ((cmd == 'w') && (obstaculo_manual != 0U))
             {
                 if (wasd_cmd != 0)
                 {

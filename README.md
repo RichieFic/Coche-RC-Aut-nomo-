@@ -103,7 +103,8 @@ Las constantes están al inicio de `main.c`. Las más usadas:
 | Constante | Qué controla |
 |---|---|
 | `TARGET_DISTANCE_M` | Distancia total de la rutina automática |
-| `US_THRESHOLD_CM` | Distancia a la que frena ante un obstáculo |
+| `US_THRESHOLD_CM` | Distancia a la que frena ante un obstáculo en la rutina automática (25 cm) |
+| `US_THRESHOLD_MANUAL_CM` | Distancia a la que se bloquea la `w` en manejo manual (12 cm) |
 | `EV_LATERAL_M`, `EV_PASAR_M`, `EV_REGRESO_M` | Longitud de los tramos del rodeo |
 | `EVASION_RODEO` | `1` = rodea y regresa a la línea; `0` = solo gira 90° y sigue |
 | `RECTO_KP` | Fuerza de la corrección de rumbo al avanzar |
