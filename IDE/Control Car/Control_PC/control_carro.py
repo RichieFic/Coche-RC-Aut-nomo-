@@ -14,6 +14,7 @@ No necesita instalar nada: usa solo Python y funciones de Windows.
 Uso (o doble clic en "Iniciar control.bat"):
     python control_carro.py                 (pregunta el puerto y el modo)
     python control_carro.py --puerto COM11  (por cable USB a la NUCLEO)
+    python control_carro.py --puerto wifi   (red WiFi "CocheAutonomo" de la ESP32)
     python control_carro.py --modo xbox
     python control_carro.py --modo teclado --puerto COM10
     python control_carro.py --simular       (sin carro: muestra lo que mandaria)
@@ -27,6 +28,7 @@ import argparse
 import ctypes
 import ctypes.wintypes as wt
 import msvcrt
+import socket
 import sys
 import time
 
@@ -134,6 +136,43 @@ class PuertoSerie:
 
     def cerrar(self):
         kernel32.CloseHandle(self.h)
+
+
+class PuertoWifi:
+    """Conexion TCP con la ESP32 (sketch ESP32_Puente_WiFi)."""
+    def __init__(self, direccion, puerto):
+        self.s = socket.create_connection((direccion, puerto), timeout=5)
+        self.s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        self.s.setblocking(False)
+
+    def escribir(self, datos: bytes):
+        try:
+            self.s.sendall(datos)
+        except BlockingIOError:
+            pass                      # buffer lleno: se manda en el siguiente ciclo
+        except OSError as e:
+            raise ConexionPerdida(f"Se perdio la conexion WiFi ({e}).")
+
+    def leer(self) -> bytes:
+        try:
+            datos = self.s.recv(4096)
+        except BlockingIOError:
+            return b""
+        except OSError as e:
+            raise ConexionPerdida(f"Se perdio la conexion WiFi ({e}).")
+        if datos == b"":
+            raise ConexionPerdida("La ESP32 cerro la conexion WiFi.")
+        return datos
+
+    def cerrar(self):
+        try:
+            self.s.close()
+        except OSError:
+            pass
+
+
+class ConexionPerdida(Exception):
+    pass
 
 
 class PuertoSimulado:
@@ -321,18 +360,25 @@ def enviar_letra(puerto, letra):
     time.sleep(0.03)
 
 
+WIFI_DIRECCION = "192.168.4.1"
+WIFI_PUERTO = 3333
+
+
 def elegir_puerto():
     print("Por donde te conectas al carro?")
-    print("  1) Bluetooth (ESP32)      -> COM10")
-    print("  2) Cable USB (NUCLEO)     -> COM11")
-    print("  3) Otro puerto")
+    print("  1) WiFi (red CocheAutonomo de la ESP32)")
+    print("  2) Bluetooth (ESP32)      -> COM10")
+    print("  3) Cable USB (NUCLEO)     -> COM11")
+    print("  4) Otro puerto COM")
     while True:
-        r = input("Elige 1, 2 o 3: ").strip()
+        r = input("Elige 1, 2, 3 o 4: ").strip()
         if r == "1":
-            return "COM10"
+            return "WIFI"
         if r == "2":
-            return "COM11"
+            return "COM10"
         if r == "3":
+            return "COM11"
+        if r == "4":
             p = input("Escribe el puerto (por ejemplo COM5): ").strip().upper()
             if p.startswith("COM") and p[3:].isdigit():
                 return p
@@ -353,7 +399,8 @@ def elegir_modo():
 def main():
     ap = argparse.ArgumentParser(description="Control del carro autonomo desde la compu")
     ap.add_argument("--modo", choices=["xbox", "teclado"])
-    ap.add_argument("--puerto", help="COM10 = Bluetooth (ESP32), COM11 = cable USB (NUCLEO)")
+    ap.add_argument("--puerto", help="WIFI, COM10 = Bluetooth (ESP32), COM11 = cable USB (NUCLEO)")
+    ap.add_argument("--ip", default=WIFI_DIRECCION, help="direccion de la ESP32 por WiFi")
     ap.add_argument("--baud", type=int, default=115200)
     ap.add_argument("--simular", action="store_true", help="probar sin carro")
     ap.add_argument("--telemetria", action="store_true", help="mostrar lineas DER:")
@@ -370,9 +417,21 @@ def main():
         print(f"ERROR: {e}")
         return 1
 
+    if args.puerto:
+        args.puerto = args.puerto.upper()
     if args.simular:
         puerto = PuertoSimulado()
         print("Modo simulacion: no se conecta al carro.")
+    elif args.puerto == "WIFI":
+        print(f"Conectando por WiFi a {args.ip}:{WIFI_PUERTO}...")
+        try:
+            puerto = PuertoWifi(args.ip, WIFI_PUERTO)
+        except OSError as e:
+            print(f"ERROR: no se pudo conectar ({e}).")
+            print("Revisa que la compu este conectada a la red WiFi 'CocheAutonomo'")
+            print("y que la ESP32 tenga cargado el sketch ESP32_Puente_WiFi.")
+            return 1
+        print("Conectado.")
     else:
         if args.puerto == "COM11":
             print("Por cable: el carro se movera con el USB conectado; cuida el cable.")
@@ -444,11 +503,15 @@ def main():
                 time.sleep(espera)
     except KeyboardInterrupt:
         pass
+    except ConexionPerdida as e:
+        print(f"\nERROR: {e} El carro se detiene solo.")
     finally:
         try:
             puerto.escribir(b"#M0,0\n")
             time.sleep(0.05)
             puerto.escribir(b"#M0,0\n")
+        except ConexionPerdida:
+            pass
         finally:
             puerto.cerrar()
         print("\nDesconectado; el carro se detiene.")

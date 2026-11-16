@@ -21,6 +21,7 @@ Firmware de un carro autónomo de tracción diferencial basado en una **NUCLEO-F
 | `IDE/Control Car/Control Car/Core/Src/gps_neo6m.c` | Driver del GPS NEO-6M |
 | `IDE/Control Car/ESP32_Puente_BT/` | Sketch de Arduino: puente Bluetooth–UART para la ESP32 (deja pasar `w a s d q` y `G`). Es el que tiene cargado la ESP32 |
 | `IDE/Control Car/ESP32_Original/` | Sketch original de la ESP32, que solo reenvía `F B L R S I` |
+| `IDE/Control Car/ESP32_Puente_WiFi/` | Alternativa al Bluetooth: la ESP32 crea la red WiFi `CocheAutonomo` (contraseña `carro1234`) y recibe el control en 192.168.4.1:3333 |
 | `IDE/Control Car/Control_PC/` | Programa en Python para manejar con el control de Xbox o el teclado |
 | `Richie's version/` | CAD en SolidWorks: ensamble principal, piezas impresas, `STL/` para imprimir y `COTS/` con modelos de componentes comerciales |
 | `GG´s version/` | CAD en SolidWorks de otra versión del chasis |
@@ -90,7 +91,7 @@ Después de soltar el botón, el LED parpadea 1.5 s antes de que el carro se mue
 
 El programa `IDE/Control Car/Control_PC/control_carro.py` permite avanzar y girar a la vez, con velocidad proporcional. No necesita instalar nada además de Python.
 
-Se abre con doble clic en **`Iniciar control.bat`** (o con `python control_carro.py`). Primero pregunta por dónde conectarse: **Bluetooth** (COM10, ESP32) o **cable USB** (COM11, NUCLEO), útil para probar antes del Bluetooth. Después pregunta el modo:
+Se abre con doble clic en **`Iniciar control.bat`** (o con `python control_carro.py`). Primero pregunta por dónde conectarse: **WiFi** (red `CocheAutonomo` de la ESP32, con el sketch `ESP32_Puente_WiFi` cargado), **Bluetooth** (COM10, sketch `ESP32_Puente_BT`) o **cable USB** (COM11, NUCLEO), útil para probar sin la ESP. Después pregunta el modo:
 
 | Modo | Manejo | Botones / teclas |
 |---|---|---|
