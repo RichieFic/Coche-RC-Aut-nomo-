@@ -21,7 +21,7 @@ Firmware de un carro autónomo de tracción diferencial basado en una **NUCLEO-F
 | `IDE/Control Car/Control Car/Core/Src/gps_neo6m.c` | Driver del GPS NEO-6M |
 | `IDE/Control Car/ESP32_Puente_BT/` | Sketch de Arduino: puente Bluetooth–UART para la ESP32 (deja pasar `w a s d q` y `G`). Es el que tiene cargado la ESP32 |
 | `IDE/Control Car/ESP32_Original/` | Sketch original de la ESP32, que solo reenvía `F B L R S I` |
-| `IDE/Control Car/ESP32_Puente_WiFi/` | Alternativa al Bluetooth: la ESP32 crea la red WiFi `CocheAutonomo` (contraseña `carro1234`) y recibe el control en 192.168.4.1:3333 |
+| `IDE/Control Car/ESP32_Puente_WiFi/` | **Vía recomendada (probada).** La ESP32 crea la red WiFi `CocheAutonomo` (contraseña `carro1234`) y recibe el control en 192.168.4.1:3333 |
 | `IDE/Control Car/Control_PC/` | Programa en Python para manejar con el control de Xbox o el teclado |
 | `Richie's version/` | CAD en SolidWorks: ensamble principal, piezas impresas, `STL/` para imprimir y `COTS/` con modelos de componentes comerciales |
 | `GG´s version/` | CAD en SolidWorks de otra versión del chasis |
