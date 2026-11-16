@@ -11,8 +11,9 @@ detiene solo a los 0.3 s.
 
 No necesita instalar nada: usa solo Python y funciones de Windows.
 
-Uso:
-    python control_carro.py                 (pregunta el modo; puerto COM10)
+Uso (o doble clic en "Iniciar control.bat"):
+    python control_carro.py                 (pregunta el puerto y el modo)
+    python control_carro.py --puerto COM11  (por cable USB a la NUCLEO)
     python control_carro.py --modo xbox
     python control_carro.py --modo teclado --puerto COM10
     python control_carro.py --simular       (sin carro: muestra lo que mandaria)
@@ -320,6 +321,23 @@ def enviar_letra(puerto, letra):
     time.sleep(0.03)
 
 
+def elegir_puerto():
+    print("Por donde te conectas al carro?")
+    print("  1) Bluetooth (ESP32)      -> COM10")
+    print("  2) Cable USB (NUCLEO)     -> COM11")
+    print("  3) Otro puerto")
+    while True:
+        r = input("Elige 1, 2 o 3: ").strip()
+        if r == "1":
+            return "COM10"
+        if r == "2":
+            return "COM11"
+        if r == "3":
+            p = input("Escribe el puerto (por ejemplo COM5): ").strip().upper()
+            if p.startswith("COM") and p[3:].isdigit():
+                return p
+
+
 def elegir_modo():
     print("Como quieres controlar el carro?")
     print("  1) Control de Xbox")
@@ -335,7 +353,7 @@ def elegir_modo():
 def main():
     ap = argparse.ArgumentParser(description="Control del carro autonomo desde la compu")
     ap.add_argument("--modo", choices=["xbox", "teclado"])
-    ap.add_argument("--puerto", default="COM10", help="COM10 = Bluetooth de la ESP32")
+    ap.add_argument("--puerto", help="COM10 = Bluetooth (ESP32), COM11 = cable USB (NUCLEO)")
     ap.add_argument("--baud", type=int, default=115200)
     ap.add_argument("--simular", action="store_true", help="probar sin carro")
     ap.add_argument("--telemetria", action="store_true", help="mostrar lineas DER:")
@@ -343,6 +361,8 @@ def main():
                     help="teclado activo aunque la ventana no este al frente")
     args = ap.parse_args()
 
+    if not args.simular and not args.puerto:
+        args.puerto = elegir_puerto()
     modo = args.modo or elegir_modo()
     try:
         entrada = ControlXbox() if modo == "xbox" else Teclado(args.sin_foco)
@@ -354,6 +374,8 @@ def main():
         puerto = PuertoSimulado()
         print("Modo simulacion: no se conecta al carro.")
     else:
+        if args.puerto == "COM11":
+            print("Por cable: el carro se movera con el USB conectado; cuida el cable.")
         print(f"Conectando a {args.puerto}... (por Bluetooth tarda unos segundos)")
         try:
             puerto = PuertoSerie(args.puerto, args.baud)

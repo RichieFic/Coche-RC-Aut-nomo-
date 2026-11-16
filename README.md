@@ -90,18 +90,14 @@ Después de soltar el botón, el LED parpadea 1.5 s antes de que el carro se mue
 
 El programa `IDE/Control Car/Control_PC/control_carro.py` permite avanzar y girar a la vez, con velocidad proporcional. No necesita instalar nada además de Python.
 
-```
-python control_carro.py
-```
-
-Al arrancar pregunta el modo:
+Se abre con doble clic en **`Iniciar control.bat`** (o con `python control_carro.py`). Primero pregunta por dónde conectarse: **Bluetooth** (COM10, ESP32) o **cable USB** (COM11, NUCLEO), útil para probar antes del Bluetooth. Después pregunta el modo:
 
 | Modo | Manejo | Botones / teclas |
 |---|---|---|
 | Control de Xbox | RT acelera, LT reversa, stick izquierdo gira | B parar, A giro 90°, Y evasión, X giros guardados, Back salir |
 | Teclado | W/S adelante/atrás, A/D girar (combinables, Shift = más rápido) | Q parar, R giro 90°, F evasión, G giros guardados, Esc salir |
 
-- Usa el puerto COM10 (Bluetooth de la ESP32) por defecto; otro puerto con `--puerto COMx`.
+- Los números de puerto son los de la compu del equipo; en otra compu revisa el Administrador de dispositivos y elige "Otro puerto".
 - Cierra Tera Term antes, porque el puerto solo lo puede usar un programa a la vez.
 - Si se cierra el programa o se corta la señal, el carro se detiene solo a los 0.3 s.
 - `--simular` prueba el control sin carro, mostrando lo que mandaría.
