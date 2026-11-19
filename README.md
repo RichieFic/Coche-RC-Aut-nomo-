@@ -107,6 +107,14 @@ Se abre con doble clic en **`Iniciar control.bat`** (o con `python control_carro
 
 Es la opción **3** de `control_carro.py`, independiente de la evasión. El carro gira sobre su eje hasta el ángulo de referencia y lo mantiene, midiendo con el giroscopio 100 veces por segundo. Los ángulos son en grados, **positivos hacia la derecha**; el 0 es hacia donde apunta el carro al activar el modo.
 
+Se abre una **ventana con la gráfica en vivo** (`angulo_gui.py`, solo usa Python):
+- **Arriba:** ángulo de referencia (rojo, discontinua) y ángulo medido (azul), últimos 20 s.
+- **Abajo:** salida del controlador `u` en % (verde).
+- **Controles:** referencia (campo o botones −90° a +180°), PID u ON/OFF, Kp/Ki/Kd, Cero y PARAR.
+- **Registro:** cada prueba se guarda en `Control_PC/registros/angulo_<fecha>.csv` (tiempo, referencia, ángulo, error, u, velocidad, modo) para graficarla en Excel.
+
+Con `--consola` se usa en modo texto, con estos comandos:
+
 | Escribes | Hace |
 |---|---|
 | `90`, `-45`, `180` | Cambia la referencia del ángulo |

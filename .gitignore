@@ -19,3 +19,7 @@ Release/
 *.bak
 Thumbs.db
 desktop.ini
+
+# Registros de pruebas del control de angulo (CSV)
+registros/
+__pycache__/

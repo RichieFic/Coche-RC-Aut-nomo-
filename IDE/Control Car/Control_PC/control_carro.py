@@ -522,6 +522,8 @@ def main():
     ap.add_argument("--modo", choices=["xbox", "teclado", "angulo"])
     ap.add_argument("--puerto", help="WIFI, COM10 = Bluetooth (ESP32), COM11 = cable USB (NUCLEO)")
     ap.add_argument("--ip", default=WIFI_DIRECCION, help="direccion de la ESP32 por WiFi")
+    ap.add_argument("--consola", action="store_true",
+                    help="control de angulo en modo texto, sin ventana ni grafica")
     ap.add_argument("--baud", type=int, default=115200)
     ap.add_argument("--simular", action="store_true", help="probar sin carro")
     ap.add_argument("--telemetria", action="store_true", help="mostrar lineas DER:")
@@ -568,7 +570,12 @@ def main():
 
     if modo == "angulo":
         try:
-            modo_angulo(puerto, args)
+            if args.consola:
+                modo_angulo(puerto, args)
+            else:
+                import angulo_gui     # ventana con grafica en vivo
+                print("Abriendo la ventana del control de angulo...")
+                angulo_gui.ejecutar(puerto)
         finally:
             puerto.cerrar()
             print("\nDesconectado; el control de angulo queda apagado.")
