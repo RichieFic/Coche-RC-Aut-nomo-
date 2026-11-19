@@ -1,9 +1,11 @@
 """
 Control del carro autonomo desde la compu, por Bluetooth (o USB).
 
-Dos modos:
+Tres modos:
   - Control de Xbox: RT acelera, LT reversa, stick izquierdo gira.
   - Teclado: W/S adelante/atras y A/D girar; se pueden combinar (W+A).
+  - Control de angulo en lazo cerrado: escribes el angulo de referencia y
+    eliges ON/OFF o PID; el carro gira sobre su eje y lo mantiene.
 
 Manda al carro la velocidad de cada rueda ("#M<izq>,<der>") unas 20 veces
 por segundo. Si el programa se cierra o se corta la senal, el carro se
@@ -388,17 +390,136 @@ def elegir_modo():
     print("Como quieres controlar el carro?")
     print("  1) Control de Xbox")
     print("  2) Teclado (W/A/S/D, se pueden combinar)")
+    print("  3) Control de angulo en lazo cerrado (ON/OFF o PID)")
     while True:
-        r = input("Elige 1 o 2: ").strip()
+        r = input("Elige 1, 2 o 3: ").strip()
         if r == "1":
             return "xbox"
         if r == "2":
             return "teclado"
+        if r == "3":
+            return "angulo"
+
+
+# ----------------------------------------------------------------------------
+# Modo 3: control de angulo en lazo cerrado
+# ----------------------------------------------------------------------------
+AYUDA_ANGULO = """
+Control de angulo (grados, + = derecha; 0 = hacia donde apuntaba al empezar)
+  90, -45, 180 ...   nueva referencia de angulo
+  pid / onoff        cambiar de controlador
+  kp 3 / ki 0.5 / kd 0.15   ganancias del PID (estas son las iniciales)
+  cero               la direccion actual pasa a ser 0
+  ver                mostrar u ocultar las lineas ANG: en vivo
+  s                  parar (apaga el control)        salir   terminar
+Prueba de perturbacion: con el control activo, gira el carro con la mano;
+debe regresar solo a la referencia.
+"""
+
+
+def modo_angulo(puerto, args):
+    import threading
+
+    estado = {"ver": True, "vivo": True, "ultimo_ang": 0.0}
+    ganancias = {"kp": 3.0, "ki": 0.5, "kd": 0.15}   # iguales a las del firmware
+
+    def lector():
+        resto = b""
+        while estado["vivo"]:
+            try:
+                datos = puerto.leer()
+            except ConexionPerdida as e:
+                print(f"\nERROR: {e}")
+                estado["vivo"] = False
+                return
+            if not datos:
+                time.sleep(0.02)
+                continue
+            resto += datos
+            *lineas, resto = resto.split(b"\n")
+            for linea in lineas:
+                texto = linea.decode(errors="replace").strip()
+                if not texto:
+                    continue
+                if texto.startswith("ANG: modo="):
+                    # Lineas de 10 por segundo: mostrar 2 por segundo
+                    if estado["ver"] and time.monotonic() - estado["ultimo_ang"] > 0.5:
+                        estado["ultimo_ang"] = time.monotonic()
+                        print(f"  {texto}")
+                elif texto.startswith("ANG:") or texto.startswith("CONTROL") or \
+                        texto.startswith("BOTON") or texto.startswith("COMANDO"):
+                    print(f"  {texto}")
+                elif args.telemetria and not texto.startswith("DER:"):
+                    print(f"  {texto}")
+            if len(resto) > 4096:
+                resto = b""
+
+    def mandar(linea):
+        puerto.escribir((linea + "\n").encode())
+
+    hilo = threading.Thread(target=lector, daemon=True)
+    hilo.start()
+    print(AYUDA_ANGULO)
+    mandar("#CP")          # activar con PID; la direccion actual es 0
+    try:
+        while estado["vivo"]:
+            try:
+                cmd = input("> ").strip().lower()
+            except EOFError:
+                break
+            if not cmd:
+                continue
+            partes = cmd.replace(",", ".").split()
+            if partes[0] in ("salir", "exit", "quit"):
+                break
+            if partes[0] in ("s", "stop", "parar"):
+                mandar("#CX")
+            elif partes[0] == "pid":
+                mandar("#CP")
+            elif partes[0] in ("onoff", "on/off", "on-off"):
+                mandar("#CO")
+            elif partes[0] == "cero":
+                mandar("#Z")
+            elif partes[0] == "ver":
+                estado["ver"] = not estado["ver"]
+                print("  (lineas ANG: visibles)" if estado["ver"] else "  (lineas ANG: ocultas)")
+            elif partes[0] in ("kp", "ki", "kd") and len(partes) == 2:
+                try:
+                    valor = float(partes[1])
+                except ValueError:
+                    print("  valor no valido")
+                    continue
+                if not 0.0 <= valor <= 99.99:
+                    print("  la ganancia debe estar entre 0 y 99.99")
+                    continue
+                ganancias[partes[0]] = valor
+                mandar("#K{},{},{}".format(*(int(round(ganancias[k] * 100))
+                                              for k in ("kp", "ki", "kd"))))
+            elif partes[0] in ("ayuda", "help", "?"):
+                print(AYUDA_ANGULO)
+            else:
+                try:
+                    ref = float(partes[0])
+                except ValueError:
+                    print("  no entendi; escribe 'ayuda'")
+                    continue
+                if not -720 <= ref <= 720:
+                    print("  la referencia debe estar entre -720 y 720 grados")
+                    continue
+                mandar(f"#A{int(round(ref))}")
+    except KeyboardInterrupt:
+        pass
+    finally:
+        estado["vivo"] = False
+        try:
+            mandar("#CX")
+        except ConexionPerdida:
+            pass
 
 
 def main():
     ap = argparse.ArgumentParser(description="Control del carro autonomo desde la compu")
-    ap.add_argument("--modo", choices=["xbox", "teclado"])
+    ap.add_argument("--modo", choices=["xbox", "teclado", "angulo"])
     ap.add_argument("--puerto", help="WIFI, COM10 = Bluetooth (ESP32), COM11 = cable USB (NUCLEO)")
     ap.add_argument("--ip", default=WIFI_DIRECCION, help="direccion de la ESP32 por WiFi")
     ap.add_argument("--baud", type=int, default=115200)
@@ -411,11 +532,13 @@ def main():
     if not args.simular and not args.puerto:
         args.puerto = elegir_puerto()
     modo = args.modo or elegir_modo()
-    try:
-        entrada = ControlXbox() if modo == "xbox" else Teclado(args.sin_foco)
-    except OSError as e:
-        print(f"ERROR: {e}")
-        return 1
+    entrada = None
+    if modo != "angulo":
+        try:
+            entrada = ControlXbox() if modo == "xbox" else Teclado(args.sin_foco)
+        except OSError as e:
+            print(f"ERROR: {e}")
+            return 1
 
     if args.puerto:
         args.puerto = args.puerto.upper()
@@ -442,6 +565,14 @@ def main():
             print(f"ERROR: {e}")
             return 1
         print("Conectado.")
+
+    if modo == "angulo":
+        try:
+            modo_angulo(puerto, args)
+        finally:
+            puerto.cerrar()
+            print("\nDesconectado; el control de angulo queda apagado.")
+        return 0
 
     if modo == "xbox":
         print("RT acelera, LT reversa, stick izquierdo gira.")

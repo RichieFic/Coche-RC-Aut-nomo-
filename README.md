@@ -103,6 +103,25 @@ Se abre con doble clic en **`Iniciar control.bat`** (o con `python control_carro
 - Si se cierra el programa o se corta la señal, el carro se detiene solo a los 0.3 s.
 - `--simular` prueba el control sin carro, mostrando lo que mandaría.
 
+### Control de ángulo en lazo cerrado
+
+Es la opción **3** de `control_carro.py`, independiente de la evasión. El carro gira sobre su eje hasta el ángulo de referencia y lo mantiene, midiendo con el giroscopio 100 veces por segundo. Los ángulos son en grados, **positivos hacia la derecha**; el 0 es hacia donde apunta el carro al activar el modo.
+
+| Escribes | Hace |
+|---|---|
+| `90`, `-45`, `180` | Cambia la referencia del ángulo |
+| `pid` / `onoff` | Cambia de controlador |
+| `kp 3`, `ki 0.5`, `kd 0.15` | Ajusta las ganancias del PID (estas son las iniciales) |
+| `cero` | La dirección actual pasa a ser 0° |
+| `ver` | Muestra u oculta las líneas `ANG:` en vivo |
+| `s` / `salir` | Para el carro / termina el programa |
+
+- **ON/OFF:** gira a velocidad fija (`ANG_ONOFF_U`) si el error pasa de 3° y se detiene al bajar de 1° (histéresis).
+- **PID:** `u = Kp·e + Ki·∫e − Kd·velocidad`. El integral solo acumula a menos de 10° de la referencia (anti-windup), y cerca de la meta usa una banda con histéresis (se detiene a menos de 1°, vuelve a corregir arriba de 2.5°) porque los motores no se mueven por debajo de cierto PWM.
+- **Perturbaciones:** con el modo activo, si se gira el carro con la mano, el controlador lo regresa a la referencia.
+- **Telemetría:** `ANG: modo=PID ref=90.0 ang=89.4 err=0.6 u=0.0 vel=0.0`, 10 veces por segundo.
+- **Salir del modo:** `s`, el botón azul, o cualquier otro comando (WASD, control de Xbox).
+
 ### Rutina de evasión
 
 1. Avanza recto manteniendo el rumbo.

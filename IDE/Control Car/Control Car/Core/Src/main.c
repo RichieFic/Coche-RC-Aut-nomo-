@@ -93,6 +93,50 @@ volatile uint8_t joy_rx_nuevo = 0U;
 volatile uint32_t joy_rx_ms = 0U;
 uint8_t joy_activo = 0U;               /* el carro se esta moviendo por el control */
 uint32_t joy_ultimo_ms = 0U;
+/* ---- Control de angulo en lazo cerrado (giroscopio) ----
+ * El carro gira sobre su eje para mantener el angulo de referencia.
+ * Angulos en grados, positivos hacia la DERECHA; 0 = hacia donde apuntaba
+ * al activar el modo (o al mandar #Z). Comandos (lineas, desde la compu):
+ *   #A<grados>   nueva referencia (activa el modo con PID si estaba apagado)
+ *   #CO / #CP    controlador ON/OFF o PID     #CX  apagar el modo y parar
+ *   #K<kp>,<ki>,<kd>  ganancias del PID x100 (p. ej. #K300,50,5)
+ *   #Z           la direccion actual pasa a ser 0
+ * u = salida del controlador, de -100 a 100 % (+ = girar a la derecha). */
+#define ANG_MODO_APAGADO       0U
+#define ANG_MODO_ONOFF         1U
+#define ANG_MODO_PID           2U
+#define ANG_PWM_MIN            31.0f   /* PWM con el que el carro empieza a girar */
+#define ANG_PWM_MAX            42.0f   /* PWM con u = 100 % */
+#define ANG_ONOFF_U            60.0f   /* % fijo del ON/OFF */
+#define ANG_ONOFF_ENCENDER_DEG 3.0f    /* ON/OFF: enciende si |error| > esto */
+#define ANG_ONOFF_APAGAR_DEG   1.0f    /* ON/OFF: apaga si |error| < esto (histeresis) */
+#define ANG_BANDA_PARAR_DEG    1.0f    /* PID: se detiene al llegar a menos de esto... */
+#define ANG_BANDA_REANUDAR_DEG 2.5f    /* ...y vuelve a corregir si el error pasa de esto */
+#define ANG_VENTANA_I_DEG      10.0f   /* el integral solo acumula cerca de la referencia */
+#define ANG_I_MAX              40.0f   /* limite del termino integral (anti-windup) */
+#define ANG_PERIODO_MS         10U     /* 100 Hz */
+#define ANG_TELEMETRIA_MS      100U
+float ang_kp = 3.0f;                   /* % por grado */
+float ang_ki = 0.5f;                   /* % por grado*segundo */
+float ang_kd = 0.15f;                  /* % por grado/segundo */
+uint8_t ang_pid_quieto = 0U;           /* PID dentro de la banda: motores parados */
+uint8_t ang_modo = ANG_MODO_APAGADO;
+float ang_ref_deg = 0.0f;
+float ang_cero_deg = 0.0f;             /* yaw_gyro_deg que corresponde a 0 */
+float ang_integral = 0.0f;
+float ang_u = 0.0f;
+float ang_err = 0.0f;
+uint8_t ang_onoff_encendido = 0U;
+uint32_t ang_ultimo_ms = 0U;
+uint32_t ang_telemetria_ms = 0U;
+/* Recibido por la interrupcion, se aplica en el lazo principal */
+volatile uint8_t ang_rx_ref_nuevo = 0U;
+volatile int32_t ang_rx_ref = 0;
+volatile uint8_t ang_rx_modo_nuevo = 0U;
+volatile uint8_t ang_rx_modo = 0U;
+volatile uint8_t ang_rx_k_nuevo = 0U;
+volatile int32_t ang_rx_k[3] = {0, 0, 0};
+volatile uint8_t ang_rx_cero = 0U;
 /* DIAGNOSTICO temporal: letras sueltas recibidas por la ESP32 (USART3). */
 volatile uint8_t rx_esp_diag[8];
 volatile uint8_t rx_esp_diag_head = 0U;
@@ -957,6 +1001,139 @@ static void DetenerTodo(void)
     evasion_fase = EV_NINGUNA;
     giro_subfase = GIRO_SUB_GIRANDO;
     boton_armado = 0U;
+    ang_modo = ANG_MODO_APAGADO;
+    ang_u = 0.0f;
+}
+/* ---------------- Control de angulo en lazo cerrado ---------------- */
+/* Angulo actual en la convencion del modo: grados, + = derecha. */
+static float AnguloActualDeg(void)
+{
+    return -(yaw_gyro_deg - ang_cero_deg);
+}
+/* Salida u de -100 a 100 %: girar sobre su eje (+ = derecha). */
+static void AnguloAplicarSalida(float u)
+{
+    float a = fabsf(u);
+    float pwm;
+    if (a < 0.5f)
+    {
+        StopMotors();
+        return;
+    }
+    if (a > 100.0f) a = 100.0f;
+    pwm = ANG_PWM_MIN + ((ANG_PWM_MAX - ANG_PWM_MIN) * a / 100.0f);
+    if (u > 0.0f) SetTurnRightDirection();
+    else SetTurnLeftDirection();
+    SetPWM(pwm, pwm);
+}
+static void AnguloActivar(uint8_t modo)
+{
+    if (ang_modo == ANG_MODO_APAGADO)
+    {
+        DetenerTodo();                 /* cancela evasion, WASD, etc. */
+        joy_activo = 0U;
+        ang_cero_deg = yaw_gyro_deg;   /* hacia donde apunta ahora = 0 */
+        ang_ref_deg = 0.0f;
+    }
+    ang_modo = modo;
+    ang_integral = 0.0f;
+    ang_onoff_encendido = 0U;
+    ang_pid_quieto = 0U;
+    ang_ultimo_ms = HAL_GetTick();
+    EnviarMensajeDebug((modo == ANG_MODO_ONOFF)
+        ? "ANG: control de angulo ACTIVO con ON/OFF\r\n"
+        : "ANG: control de angulo ACTIVO con PID\r\n");
+}
+static void AnguloApagar(void)
+{
+    if (ang_modo != ANG_MODO_APAGADO)
+    {
+        ang_modo = ANG_MODO_APAGADO;
+        ang_u = 0.0f;
+        StopMotors();
+        EnviarMensajeDebug("ANG: control de angulo apagado, PARADO\r\n");
+    }
+}
+/* Un paso del controlador (cada ANG_PERIODO_MS) y la telemetria ANG:. */
+static void AnguloPaso(void)
+{
+    uint32_t ahora = HAL_GetTick();
+    float dt;
+    float yaw;
+    float vel;
+    float e;
+    float u;
+
+    if (ang_modo == ANG_MODO_APAGADO) return;
+    if ((ahora - ang_ultimo_ms) < ANG_PERIODO_MS) return;
+    dt = (float)(ahora - ang_ultimo_ms) / 1000.0f;
+    if (dt > 0.1f) dt = 0.1f;
+    ang_ultimo_ms = ahora;
+
+    yaw = AnguloActualDeg();
+    vel = -gyro_rate_dps;              /* grados/s, + = girando a la derecha */
+    e = ang_ref_deg - yaw;
+    ang_err = e;
+
+    if (ang_modo == ANG_MODO_ONOFF)
+    {
+        /* ON/OFF con histeresis: velocidad fija hacia la referencia. */
+        if ((ang_onoff_encendido == 0U) && (fabsf(e) > ANG_ONOFF_ENCENDER_DEG)) ang_onoff_encendido = 1U;
+        if ((ang_onoff_encendido != 0U) && (fabsf(e) < ANG_ONOFF_APAGAR_DEG)) ang_onoff_encendido = 0U;
+        u = (ang_onoff_encendido == 0U) ? 0.0f : ((e > 0.0f) ? ANG_ONOFF_U : -ANG_ONOFF_U);
+    }
+    else
+    {
+        /* PID: proporcional + integral - derivativo sobre la medicion.
+         * Los motores no se mueven por debajo de ANG_PWM_MIN, asi que cerca de
+         * la referencia se usa una banda con histeresis para no oscilar, y el
+         * integral solo acumula dentro de ANG_VENTANA_I_DEG (anti-windup). */
+        if ((ang_pid_quieto != 0U) && (fabsf(e) > ANG_BANDA_REANUDAR_DEG)) ang_pid_quieto = 0U;
+        if ((ang_pid_quieto == 0U) && (fabsf(e) <= ANG_BANDA_PARAR_DEG) && (fabsf(vel) < 10.0f))
+        {
+            ang_pid_quieto = 1U;
+            ang_integral = 0.0f;
+        }
+        if (ang_pid_quieto != 0U)
+        {
+            u = 0.0f;
+        }
+        else
+        {
+            if (fabsf(e) < ANG_VENTANA_I_DEG)
+            {
+                ang_integral += ang_ki * e * dt;
+                if (ang_integral > ANG_I_MAX) ang_integral = ANG_I_MAX;
+                if (ang_integral < -ANG_I_MAX) ang_integral = -ANG_I_MAX;
+            }
+            else
+            {
+                ang_integral = 0.0f;
+            }
+            u = (ang_kp * e) + ang_integral - (ang_kd * vel);
+            if (u > 100.0f) u = 100.0f;
+            if (u < -100.0f) u = -100.0f;
+        }
+    }
+    ang_u = u;
+    AnguloAplicarSalida(u);
+
+    if ((ahora - ang_telemetria_ms) >= ANG_TELEMETRIA_MS)
+    {
+        char linea[140];
+        char t_ref[16], t_yaw[16], t_err[16], t_u[16], t_vel[16];
+        ang_telemetria_ms = ahora;
+        FormatearFijo(t_ref, sizeof(t_ref), ang_ref_deg, 1U);
+        FormatearFijo(t_yaw, sizeof(t_yaw), yaw, 1U);
+        FormatearFijo(t_err, sizeof(t_err), e, 1U);
+        FormatearFijo(t_u, sizeof(t_u), u, 1U);
+        FormatearFijo(t_vel, sizeof(t_vel), vel, 1U);
+        snprintf(linea, sizeof(linea),
+                 "ANG: modo=%s ref=%s ang=%s err=%s u=%s vel=%s\r\n",
+                 (ang_modo == ANG_MODO_ONOFF) ? "ONOFF" : "PID",
+                 t_ref, t_yaw, t_err, t_u, t_vel);
+        EnviarMensajeDebug(linea);
+    }
 }
 /* Inicia un tramo recto del rodeo (LATERAL, PASAR o REGRESO). */
 static void IniciarTramoEvasion(uint8_t fase)
@@ -1028,6 +1205,50 @@ static uint8_t LeerEnteroLinea(const volatile char *s, uint8_t len, uint8_t *pos
     *valor = (negativo != 0U) ? -v : v;
     return digitos;
 }
+/* Comandos del control de angulo: "A<grados>", "CO"/"CP"/"CX",
+ * "K<kp>,<ki>,<kd>" (x100) y "Z". Se llama desde la interrupcion. */
+static void ProcesarLineaAngulo(const volatile char *s, uint8_t len)
+{
+    uint8_t pos = 1U;
+    int32_t v[3];
+    uint8_t i;
+
+    if (s[0] == 'A')
+    {
+        if (LeerEnteroLinea(s, len, &pos, &v[0]) == 0U) return;
+        if ((pos != len) || (v[0] < -720) || (v[0] > 720)) return;
+        ang_rx_ref = v[0];
+        ang_rx_ref_nuevo = 1U;
+    }
+    else if ((s[0] == 'C') && (len == 2U))
+    {
+        if (s[1] == 'O') ang_rx_modo = ANG_MODO_ONOFF;
+        else if (s[1] == 'P') ang_rx_modo = ANG_MODO_PID;
+        else if (s[1] == 'X') ang_rx_modo = ANG_MODO_APAGADO;
+        else return;
+        ang_rx_modo_nuevo = 1U;
+    }
+    else if (s[0] == 'K')
+    {
+        for (i = 0U; i < 3U; i++)
+        {
+            if (LeerEnteroLinea(s, len, &pos, &v[i]) == 0U) return;
+            if ((v[i] < 0) || (v[i] > 9999)) return;
+            if (i < 2U)
+            {
+                if ((pos >= len) || (s[pos] != ',')) return;
+                pos++;
+            }
+        }
+        if (pos != len) return;
+        for (i = 0U; i < 3U; i++) ang_rx_k[i] = v[i];
+        ang_rx_k_nuevo = 1U;
+    }
+    else if ((s[0] == 'Z') && (len == 1U))
+    {
+        ang_rx_cero = 1U;
+    }
+}
 /* Interpreta "M<izq>,<der>" (sin el '#'). Se llama desde la interrupcion. */
 static void ProcesarLineaJoystick(uint8_t idx, uint32_t ahora)
 {
@@ -1037,6 +1258,11 @@ static void ProcesarLineaJoystick(uint8_t idx, uint32_t ahora)
     int32_t izq;
     int32_t der;
 
+    if ((len >= 1U) && (s[0] != 'M'))
+    {
+        ProcesarLineaAngulo(s, len);
+        return;
+    }
     if ((len < 4U) || (s[0] != 'M')) return;
     if (LeerEnteroLinea(s, len, &pos, &izq) == 0U) return;
     if ((pos >= len) || (s[pos] != ',')) return;
@@ -1051,6 +1277,7 @@ static void ProcesarLineaJoystick(uint8_t idx, uint32_t ahora)
 }
 void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
 {
+    uint8_t en_linea;
     uint8_t dato;
     uint8_t idx;
     uint32_t ahora;
@@ -1071,6 +1298,9 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
     }
 
     ahora = HAL_GetTick();
+    /* Los bytes de una linea "#..." nunca son comandos de letra suelta
+     * (si no, la 'A' de "#A90" escrita en Tera Term giraria a la izquierda). */
+    en_linea = ((dato == '#') || (joy_linea_activa[idx] != 0U)) ? 1U : 0U;
     /* Linea del control proporcional "#M<izq>,<der>\n". Se arma aparte;
      * sus bytes ademas cancelan cualquier letra candidata (no son comandos). */
     if (dato == '#')
@@ -1106,7 +1336,11 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
             rx_esp_diag_head = sig;
         }
     }
-    if (EsLetraComando(dato) != 0U)
+    if (en_linea != 0U)
+    {
+        uart_cmd_candidato[idx] = 0;
+    }
+    else if (EsLetraComando(dato) != 0U)
     {
         if ((ahora - uart_ultimo_byte_ms[idx]) >= CMD_GAP_MS)
         {
@@ -1425,6 +1659,7 @@ int main(void)
             uint32_t ahora_b = HAL_GetTick();
             uint8_t boton = (HAL_GPIO_ReadPin(B1_GPIO_Port, B1_Pin) == GPIO_PIN_RESET) ? 0U : 1U;
             uint8_t en_movimiento = ((modo_automatico != 0U) || (yaw_turn_active != 0U) ||
+                                     (ang_modo != ANG_MODO_APAGADO) ||
                                      (wasd_cmd != 0) || (modo_lazo_abierto != 0U) ||
                                      (pwm_actual_izquierdo > 0.0f) || (pwm_actual_derecho > 0.0f))
                                     ? 1U : 0U;
@@ -2348,7 +2583,64 @@ int main(void)
         if (cmd != 0)
         {
             joy_activo = 0U;   /* cualquier comando de teclado/boton toma el control */
+            if (ang_modo != ANG_MODO_APAGADO)
+            {
+                /* Sin parar motores: el comando recien aplicado manda. */
+                ang_modo = ANG_MODO_APAGADO;
+                ang_u = 0.0f;
+                EnviarMensajeDebug("ANG: control de angulo apagado por un comando\r\n");
+            }
         }
+        /* Control de angulo: aplicar lo recibido y dar un paso del controlador. */
+        if (ang_rx_modo_nuevo != 0U)
+        {
+            uint8_t m = ang_rx_modo;
+            ang_rx_modo_nuevo = 0U;
+            if (m == ANG_MODO_APAGADO) AnguloApagar();
+            else if ((giro_fuente == GIRO_FUENTE_GYRO) && (gyro_ok != 0U)) AnguloActivar(m);
+            else EnviarMensajeDebug("ANG: no disponible (sin giroscopio)\r\n");
+        }
+        if (ang_rx_ref_nuevo != 0U)
+        {
+            int32_t r = ang_rx_ref;
+            ang_rx_ref_nuevo = 0U;
+            if ((ang_modo == ANG_MODO_APAGADO) && (giro_fuente == GIRO_FUENTE_GYRO) && (gyro_ok != 0U))
+            {
+                AnguloActivar(ANG_MODO_PID);
+            }
+            if (ang_modo != ANG_MODO_APAGADO)
+            {
+                char m_ref[60];
+                ang_ref_deg = (float)r;
+                snprintf(m_ref, sizeof(m_ref), "ANG: nueva referencia = %ld grados\r\n", (long)r);
+                EnviarMensajeDebug(m_ref);
+            }
+            else
+            {
+                EnviarMensajeDebug("ANG: no disponible (sin giroscopio)\r\n");
+            }
+        }
+        if (ang_rx_k_nuevo != 0U)
+        {
+            char m_k[90];
+            ang_kp = (float)ang_rx_k[0] / 100.0f;
+            ang_ki = (float)ang_rx_k[1] / 100.0f;
+            ang_kd = (float)ang_rx_k[2] / 100.0f;
+            ang_integral = 0.0f;
+            ang_rx_k_nuevo = 0U;
+            snprintf(m_k, sizeof(m_k), "ANG: ganancias x100 Kp=%ld Ki=%ld Kd=%ld\r\n",
+                     (long)ang_rx_k[0], (long)ang_rx_k[1], (long)ang_rx_k[2]);
+            EnviarMensajeDebug(m_k);
+        }
+        if (ang_rx_cero != 0U)
+        {
+            ang_rx_cero = 0U;
+            ang_cero_deg = yaw_gyro_deg;
+            ang_ref_deg = 0.0f;
+            ang_integral = 0.0f;
+            EnviarMensajeDebug("ANG: direccion actual = 0 grados\r\n");
+        }
+        AnguloPaso();
         if (joy_rx_nuevo != 0U)
         {
             int32_t j_izq;
