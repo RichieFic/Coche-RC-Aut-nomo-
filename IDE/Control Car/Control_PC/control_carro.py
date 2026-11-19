@@ -216,6 +216,7 @@ class XINPUT_STATE(ctypes.Structure):
 
 BOTON_A, BOTON_B, BOTON_X, BOTON_Y = 0x1000, 0x2000, 0x4000, 0x8000
 BOTON_BACK = 0x0020
+BOTON_RB = 0x0200
 
 
 def cargar_xinput():
@@ -272,6 +273,8 @@ class ControlXbox:
             letras.append("F")
         if nuevos & BOTON_X:
             letras.append("G")
+        if nuevos & BOTON_RB:
+            letras.append("ASIST")
         salir = bool(nuevos & BOTON_BACK)
         return acel, giro, letras, salir
 
@@ -279,7 +282,7 @@ class ControlXbox:
 # ----------------------------------------------------------------------------
 # Teclado (lee las teclas presionadas, asi W+A funciona a la vez)
 # ----------------------------------------------------------------------------
-VK = {"W": 0x57, "A": 0x41, "S": 0x53, "D": 0x44, "Q": 0x51, "R": 0x52,
+VK = {"W": 0x57, "A": 0x41, "S": 0x53, "D": 0x44, "Q": 0x51, "R": 0x52, "H": 0x48,
       "F": 0x46, "G": 0x47, "SHIFT": 0x10, "ESC": 0x1B}
 
 
@@ -315,7 +318,7 @@ class Teclado:
         acel = (vel if tecla("W") else 0.0) - (vel if tecla("S") else 0.0)
         giro = (1.0 if tecla("D") else 0.0) - (1.0 if tecla("A") else 0.0)
 
-        ahora = {n for n in ("Q", "R", "F", "G", "ESC") if tecla(n)}
+        ahora = {n for n in ("Q", "R", "F", "G", "H", "ESC") if tecla(n)}
         nuevas = ahora - self.previas
         self.previas = ahora
         letras = []
@@ -324,6 +327,8 @@ class Teclado:
         for n in ("R", "F", "G"):
             if n in nuevas:
                 letras.append(n)
+        if "H" in nuevas:
+            letras.append("ASIST")
         return acel, giro, letras, "ESC" in nuevas, False
 
 
@@ -584,12 +589,17 @@ def main():
     if modo == "xbox":
         print("RT acelera, LT reversa, stick izquierdo gira.")
         print("B = parar   A = giro 90   Y = evasion (F)   X = giros guardados   Back = salir")
+        print("RB = prender/apagar la asistencia de rumbo")
     else:
         print("W/S adelante/atras, A/D girar (se pueden combinar), Shift = mas rapido.")
         print("Q = parar   R = giro 90   F = evasion   G = giros guardados   Esc = salir")
+        print("H = prender/apagar la asistencia de rumbo")
         print("Deja esta ventana al frente mientras manejas.")
+    print("Asistencia de rumbo ON: al soltar el giro, el carro mantiene ese angulo")
+    print("aunque lo empujen o lo giren con la mano.")
 
-    ceros_pendientes = 0
+    asistencia = True
+    puerto.escribir(b"#H1\n")
     resto = b""
     ultimo_estado = 0.0
     try:
@@ -604,19 +614,21 @@ def main():
                 break
 
             for letra in letras:
+                if letra == "ASIST":
+                    asistencia = not asistencia
+                    puerto.escribir(b"#H1\n" if asistencia else b"#H0\n")
+                    print(f"\n[asistencia de rumbo {'ON' if asistencia else 'OFF'}]")
+                    continue
                 if letra == "S":
                     puerto.escribir(b"#M0,0\n")
-                    ceros_pendientes = 0
                 enviar_letra(puerto, letra)
                 print(f"\n[enviado {letra}]")
 
+            # Se manda siempre (tambien 0,0): es la senal de "sigo aqui" que
+            # permite al carro mantener el angulo aun detenido. Si deja de
+            # llegar 0.3 s, el carro se para.
             izq, der = mezclar(acel, giro)
-            if izq != 0 or der != 0:
-                puerto.escribir(f"#M{izq},{der}\n".encode())
-                ceros_pendientes = 3
-            elif ceros_pendientes > 0:
-                puerto.escribir(b"#M0,0\n")
-                ceros_pendientes -= 1
+            puerto.escribir(f"#M{izq},{der}\n".encode())
 
             # Telemetria del carro
             datos = puerto.leer()

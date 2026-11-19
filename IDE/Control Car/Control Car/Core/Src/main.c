@@ -137,6 +137,29 @@ volatile uint8_t ang_rx_modo = 0U;
 volatile uint8_t ang_rx_k_nuevo = 0U;
 volatile int32_t ang_rx_k[3] = {0, 0, 0};
 volatile uint8_t ang_rx_cero = 0U;
+/* ---- Asistencia de rumbo en el teleoperado (control de Xbox / teclado) ----
+ * Mientras el usuario gira, el carro obedece y el angulo guardado se
+ * actualiza. Al soltar el giro, espera TELE_ASENTAR_MS y guarda ese angulo;
+ * despues el PID de angulo lo mantiene ante perturbaciones: avanzando corrige
+ * con la diferencia entre ruedas y detenido gira sobre su eje.
+ * #H1 / #H0 la prende o apaga (RB en el control, H en el teclado). */
+#define TELE_ASISTENCIA_INICIAL 1U
+#define TELE_GIRO_UMBRAL       5       /* giro del usuario (de 100) que cuenta como "girando" */
+#define TELE_ASENTAR_MS        250U    /* tras soltar el giro, esperar antes de fijar el angulo */
+#define TELE_FACTOR_MOV        0.5f    /* avanzando: correccion entre ruedas = u * esto */
+#define TELE_CORR_MAX          50.0f
+#define TELE_TELEMETRIA_MS     500U
+uint8_t tele_asistencia = TELE_ASISTENCIA_INICIAL;
+int32_t tele_cmd_izq = 0;
+int32_t tele_cmd_der = 0;
+float tele_ref_deg = 0.0f;             /* angulo guardado, + = derecha (marco -yaw_gyro_deg) */
+float tele_integral = 0.0f;
+uint8_t tele_quieto = 0U;
+uint32_t tele_soltado_ms = 0U;
+uint32_t tele_ultimo_ms = 0U;
+uint32_t tele_telemetria_ms = 0U;
+volatile uint8_t tele_rx_asistencia_nuevo = 0U;
+volatile uint8_t tele_rx_asistencia = 0U;
 /* DIAGNOSTICO temporal: letras sueltas recibidas por la ESP32 (USART3). */
 volatile uint8_t rx_esp_diag[8];
 volatile uint8_t rx_esp_diag_head = 0U;
@@ -1054,6 +1077,36 @@ static void AnguloApagar(void)
         EnviarMensajeDebug("ANG: control de angulo apagado, PARADO\r\n");
     }
 }
+/* PID de angulo (lo usan el modo de angulo y la asistencia del teleoperado).
+ * u = Kp*e + Ki*integral(e) - Kd*velocidad, de -100 a 100 %.
+ * Los motores no se mueven por debajo de ANG_PWM_MIN, asi que cerca de la
+ * referencia se usa una banda con histeresis para no oscilar, y el integral
+ * solo acumula dentro de ANG_VENTANA_I_DEG (anti-windup). */
+static float PidAngulo(float e, float vel, float dt, float *integral, uint8_t *quieto)
+{
+    float u;
+    if ((*quieto != 0U) && (fabsf(e) > ANG_BANDA_REANUDAR_DEG)) *quieto = 0U;
+    if ((*quieto == 0U) && (fabsf(e) <= ANG_BANDA_PARAR_DEG) && (fabsf(vel) < 10.0f))
+    {
+        *quieto = 1U;
+        *integral = 0.0f;
+    }
+    if (*quieto != 0U) return 0.0f;
+    if (fabsf(e) < ANG_VENTANA_I_DEG)
+    {
+        *integral += ang_ki * e * dt;
+        if (*integral > ANG_I_MAX) *integral = ANG_I_MAX;
+        if (*integral < -ANG_I_MAX) *integral = -ANG_I_MAX;
+    }
+    else
+    {
+        *integral = 0.0f;
+    }
+    u = (ang_kp * e) + *integral - (ang_kd * vel);
+    if (u > 100.0f) u = 100.0f;
+    if (u < -100.0f) u = -100.0f;
+    return u;
+}
 /* Un paso del controlador (cada ANG_PERIODO_MS) y la telemetria ANG:. */
 static void AnguloPaso(void)
 {
@@ -1084,36 +1137,7 @@ static void AnguloPaso(void)
     }
     else
     {
-        /* PID: proporcional + integral - derivativo sobre la medicion.
-         * Los motores no se mueven por debajo de ANG_PWM_MIN, asi que cerca de
-         * la referencia se usa una banda con histeresis para no oscilar, y el
-         * integral solo acumula dentro de ANG_VENTANA_I_DEG (anti-windup). */
-        if ((ang_pid_quieto != 0U) && (fabsf(e) > ANG_BANDA_REANUDAR_DEG)) ang_pid_quieto = 0U;
-        if ((ang_pid_quieto == 0U) && (fabsf(e) <= ANG_BANDA_PARAR_DEG) && (fabsf(vel) < 10.0f))
-        {
-            ang_pid_quieto = 1U;
-            ang_integral = 0.0f;
-        }
-        if (ang_pid_quieto != 0U)
-        {
-            u = 0.0f;
-        }
-        else
-        {
-            if (fabsf(e) < ANG_VENTANA_I_DEG)
-            {
-                ang_integral += ang_ki * e * dt;
-                if (ang_integral > ANG_I_MAX) ang_integral = ANG_I_MAX;
-                if (ang_integral < -ANG_I_MAX) ang_integral = -ANG_I_MAX;
-            }
-            else
-            {
-                ang_integral = 0.0f;
-            }
-            u = (ang_kp * e) + ang_integral - (ang_kd * vel);
-            if (u > 100.0f) u = 100.0f;
-            if (u < -100.0f) u = -100.0f;
-        }
+        u = PidAngulo(e, vel, dt, &ang_integral, &ang_pid_quieto);
     }
     ang_u = u;
     AnguloAplicarSalida(u);
@@ -1132,6 +1156,76 @@ static void AnguloPaso(void)
                  "ANG: modo=%s ref=%s ang=%s err=%s u=%s vel=%s\r\n",
                  (ang_modo == ANG_MODO_ONOFF) ? "ONOFF" : "PID",
                  t_ref, t_yaw, t_err, t_u, t_vel);
+        EnviarMensajeDebug(linea);
+    }
+}
+/* ---------------- Asistencia de rumbo en el teleoperado ---------------- */
+static uint8_t TeleAsistenciaDisponible(void)
+{
+    return ((tele_asistencia != 0U) && (giro_fuente == GIRO_FUENTE_GYRO) && (gyro_ok != 0U)) ? 1U : 0U;
+}
+/* Un paso (cada ANG_PERIODO_MS) mientras se maneja con el control/teclado. */
+static void TelePaso(void)
+{
+    uint32_t ahora = HAL_GetTick();
+    float dt;
+    float yaw;
+    float vel;
+    float e;
+    float u;
+    int32_t avance;
+    int32_t giro;
+
+    if ((joy_activo == 0U) || (TeleAsistenciaDisponible() == 0U)) return;
+    if ((ahora - tele_ultimo_ms) < ANG_PERIODO_MS) return;
+    dt = (float)(ahora - tele_ultimo_ms) / 1000.0f;
+    if (dt > 0.1f) dt = 0.1f;
+    tele_ultimo_ms = ahora;
+
+    yaw = -yaw_gyro_deg;               /* + = derecha */
+    vel = -gyro_rate_dps;
+    avance = (tele_cmd_izq + tele_cmd_der) / 2;
+    giro = (tele_cmd_izq - tele_cmd_der) / 2;
+
+    /* El usuario esta girando, o acaba de soltar: obedecer y seguir
+     * actualizando el angulo guardado. */
+    if ((giro > TELE_GIRO_UMBRAL) || (giro < -TELE_GIRO_UMBRAL)) tele_soltado_ms = ahora;
+    if ((ahora - tele_soltado_ms) < TELE_ASENTAR_MS)
+    {
+        tele_ref_deg = yaw;
+        tele_integral = 0.0f;
+        tele_quieto = 0U;
+        if ((tele_cmd_izq == 0) && (tele_cmd_der == 0)) StopMotors();
+        else SetMotoresConSigno(tele_cmd_izq, tele_cmd_der);
+        return;
+    }
+
+    /* Mantener el angulo guardado con el PID de angulo. */
+    e = tele_ref_deg - yaw;
+    u = PidAngulo(e, vel, dt, &tele_integral, &tele_quieto);
+    if (avance == 0)
+    {
+        AnguloAplicarSalida(u);        /* detenido: girar sobre su eje */
+    }
+    else
+    {
+        float c = u * TELE_FACTOR_MOV; /* avanzando: diferencia entre ruedas */
+        if (c > TELE_CORR_MAX) c = TELE_CORR_MAX;
+        if (c < -TELE_CORR_MAX) c = -TELE_CORR_MAX;
+        SetMotoresConSigno(avance + (int32_t)c, avance - (int32_t)c);
+    }
+
+    if ((ahora - tele_telemetria_ms) >= TELE_TELEMETRIA_MS)
+    {
+        char linea[110];
+        char t_ref[16], t_yaw[16], t_err[16], t_u[16];
+        tele_telemetria_ms = ahora;
+        FormatearFijo(t_ref, sizeof(t_ref), tele_ref_deg, 1U);
+        FormatearFijo(t_yaw, sizeof(t_yaw), yaw, 1U);
+        FormatearFijo(t_err, sizeof(t_err), e, 1U);
+        FormatearFijo(t_u, sizeof(t_u), u, 1U);
+        snprintf(linea, sizeof(linea), "RUMBO: fijo=%s ang=%s err=%s u=%s\r\n",
+                 t_ref, t_yaw, t_err, t_u);
         EnviarMensajeDebug(linea);
     }
 }
@@ -1247,6 +1341,11 @@ static void ProcesarLineaAngulo(const volatile char *s, uint8_t len)
     else if ((s[0] == 'Z') && (len == 1U))
     {
         ang_rx_cero = 1U;
+    }
+    else if ((s[0] == 'H') && (len == 2U) && ((s[1] == '0') || (s[1] == '1')))
+    {
+        tele_rx_asistencia = (s[1] == '1') ? 1U : 0U;
+        tele_rx_asistencia_nuevo = 1U;
     }
 }
 /* Interpreta "M<izq>,<der>" (sin el '#'). Se llama desde la interrupcion. */
@@ -2655,8 +2754,14 @@ int main(void)
             {
                 if (joy_activo != 0U)
                 {
-                    StopMotors();
-                    joy_activo = 0U;
+                    tele_cmd_izq = 0;
+                    tele_cmd_der = 0;
+                    if (TeleAsistenciaDisponible() == 0U)
+                    {
+                        StopMotors();
+                        joy_activo = 0U;
+                    }
+                    /* Con asistencia: sigue activo y TelePaso mantiene el angulo. */
                 }
             }
             else
@@ -2666,7 +2771,13 @@ int main(void)
                     /* Tomar el control: cancelar evasion, giros, WASD, etc. */
                     DetenerTodo();
                     joy_activo = 1U;
-                    EnviarMensajeDebug("CONTROL: mando proporcional activo\r\n");
+                    tele_ref_deg = -yaw_gyro_deg;
+                    tele_soltado_ms = HAL_GetTick();
+                    tele_integral = 0.0f;
+                    tele_quieto = 0U;
+                    EnviarMensajeDebug((TeleAsistenciaDisponible() != 0U)
+                        ? "CONTROL: mando proporcional activo (asistencia de rumbo ON)\r\n"
+                        : "CONTROL: mando proporcional activo\r\n");
                 }
                 if ((obstaculo_manual != 0U) && ((j_izq + j_der) > 0))
                 {
@@ -2676,9 +2787,28 @@ int main(void)
                     j_izq -= avance;
                     j_der -= avance;
                 }
-                SetMotoresConSigno(j_izq, j_der);
+                tele_cmd_izq = j_izq;
+                tele_cmd_der = j_der;
+                if (TeleAsistenciaDisponible() == 0U)
+                {
+                    SetMotoresConSigno(j_izq, j_der);
+                }
             }
         }
+        if (tele_rx_asistencia_nuevo != 0U)
+        {
+            tele_asistencia = tele_rx_asistencia;
+            tele_rx_asistencia_nuevo = 0U;
+            tele_ref_deg = -yaw_gyro_deg;
+            tele_soltado_ms = HAL_GetTick();
+            if ((tele_asistencia == 0U) && (joy_activo != 0U))
+            {
+                SetMotoresConSigno(tele_cmd_izq, tele_cmd_der);
+            }
+            EnviarMensajeDebug((tele_asistencia != 0U) ? "ASISTENCIA DE RUMBO: ON\r\n"
+                                                       : "ASISTENCIA DE RUMBO: OFF\r\n");
+        }
+        TelePaso();
         if ((joy_activo != 0U) && ((HAL_GetTick() - joy_ultimo_ms) > JOY_TIMEOUT_MS))
         {
             StopMotors();

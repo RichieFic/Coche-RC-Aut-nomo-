@@ -95,8 +95,10 @@ Se abre con doble clic en **`Iniciar control.bat`** (o con `python control_carro
 
 | Modo | Manejo | Botones / teclas |
 |---|---|---|
-| Control de Xbox | RT acelera, LT reversa, stick izquierdo gira | B parar, A giro 90°, Y evasión, X giros guardados, Back salir |
-| Teclado | W/S adelante/atrás, A/D girar (combinables, Shift = más rápido) | Q parar, R giro 90°, F evasión, G giros guardados, Esc salir |
+| Control de Xbox | RT acelera, LT reversa, stick izquierdo gira | B parar, A giro 90°, Y evasión, X giros guardados, **RB asistencia de rumbo**, Back salir |
+| Teclado | W/S adelante/atrás, A/D girar (combinables, Shift = más rápido) | Q parar, R giro 90°, F evasión, G giros guardados, **H asistencia de rumbo**, Esc salir |
+
+**Asistencia de rumbo (lazo cerrado en el teleoperado).** Empieza prendida. Mientras giras, el carro obedece; al soltar el giro, guarda ese ángulo y el mismo PID del control de ángulo lo mantiene ante perturbaciones: avanzando corrige con la diferencia de velocidad entre las ruedas (si lo empujan de lado sigue recto) y detenido gira sobre su eje para regresar. Muestra `RUMBO: fijo=... ang=... err=... u=...` dos veces por segundo. Parar (B / Q) suelta el carro. Para mantener el ángulo estando detenido, el programa manda la señal del control todo el tiempo, también en reposo.
 
 - Los números de puerto son los de la compu del equipo; en otra compu revisa el Administrador de dispositivos y elige "Otro puerto".
 - Cierra Tera Term antes, porque el puerto solo lo puede usar un programa a la vez.
