@@ -81,6 +81,15 @@ float MPU9250_GyroProject(const float xyz_dps[3]);
  * si el campo horizontal esta fuera de rango. No usa ni cambia la calibracion. */
 float MPU9250_HeadingInclinado(const MPU9250_Data_t *d, uint8_t *valido);
 
+/* Correccion EXTRA para la placa de canto (aparte de MPU9250_CalibrateMag):
+ * en ejes del MPU, m = (m - off) * esc antes de calcular el rumbo. Sale de una
+ * vuelta completa del carro (dashboard: "Calibrar magnetometro"). */
+void MPU9250_SetCorreccionCanto(const float off_uT[3], const float esc[3]);
+
+/* Campo magnetico en ejes del MPU (uT), con la calibracion original pero SIN
+ * la correccion de canto: es lo que el dashboard usa para calcularla. */
+void MPU9250_VectorMpu(const MPU9250_Data_t *d, float m[3]);
+
 /* Promedia la velocidad proyectada durante ms milisegundos con el carro quieto.
  * Regresa HAL_ERROR si detecta movimiento (rango > 3 dps). */
 HAL_StatusTypeDef MPU9250_GyroCalibrateBias(I2C_HandleTypeDef *hi2c,

@@ -83,7 +83,7 @@ volatile uint8_t uart_ultimo_dato[2] = {0U, 0U};   /* ultimo byte recibido por c
 #define JOY_TIMEOUT_MS         300U
 #define JOY_PWM_MIN            26.0f   /* PWM con el que la rueda empieza a moverse */
 #define JOY_PWM_MAX            45.0f   /* PWM con el stick/gatillo a fondo (max 49) */
-#define JOY_LINEA_MAX          16U
+#define JOY_LINEA_MAX          40U
 volatile uint8_t joy_linea_activa[2] = {0U, 0U};
 volatile uint8_t joy_linea_len[2] = {0U, 0U};
 volatile char joy_linea[2][JOY_LINEA_MAX];
@@ -214,6 +214,17 @@ float us_ultima_cm = -1.0f;            /* ultima lectura del ultrasonico (-1 = s
 /* Rumbo magnetico (IMU de canto): desfase entre el eje de referencia de la
  * placa y el frente del carro, mas la declinacion. Se ajusta en la prueba. */
 #define MAG_OFFSET_DEG         0.0f
+/* Correccion de canto por omision (ejes del MPU, uT), medida el 2026-11-20
+ * girando el carro a mano 4 x 90 grados. El dashboard manda una mejor con #Q
+ * despues de "Calibrar magnetometro" (una vuelta completa). */
+#define MAG_CANTO_OFF_X        0.0f
+#define MAG_CANTO_OFF_Y        (-19.6f)
+#define MAG_CANTO_OFF_Z        110.8f
+#define MAG_CANTO_ESC_X        1.0f
+#define MAG_CANTO_ESC_Y        1.24f
+#define MAG_CANTO_ESC_Z        0.837f
+volatile int32_t mag_rx_q[6];
+volatile uint8_t mag_rx_q_nuevo = 0U;
 uint32_t ruta_espera_ms = RUTA_ESPERA_MS_DEF;
 int32_t ruta_avance = RUTA_AVANCE_DEF;
 volatile int32_t ruta_rx_avance = -1;
@@ -1407,18 +1418,21 @@ static void OdometriaPaso(void)
 
     if ((ahora - odo_telemetria_ms) >= ODO_TELEMETRIA_MS)
     {
-        char linea[160];
+        char linea[220];
+        float mv3[3];
+        MPU9250_VectorMpu(&imuData, mv3);
         odo_telemetria_ms = ahora;
         snprintf(linea, sizeof(linea),
                  "P: x=%ld y=%ld th=%ld v=%ld rd=%ld ri=%ld pd=%ld pi=%ld us=%ld md=%s wp=%u/%u"
-                 " mg=%ld mv=%u\r\n",
+                 " mg=%ld mv=%u mx=%ld my=%ld mz=%ld\r\n",
                  (long)(odo_x_m * 1000.0f), (long)(odo_y_m * 1000.0f),
                  (long)(odo_theta_deg * 10.0f), (long)(odo_v_ms * 1000.0f),
                  (long)(rpm_motor_derecho * 10.0f), (long)(rpm_motor_izquierdo * 10.0f),
                  (long)(pwm_actual_derecho * 10.0f), (long)(pwm_actual_izquierdo * 10.0f),
                  (long)(us_ultima_cm * 10.0f), ModoTexto(),
                  (unsigned int)ruta_idx, (unsigned int)ruta_n,
-                 (long)(imu_mag_norte_deg * 10.0f), (unsigned int)imu_mag_norte_ok);
+                 (long)(imu_mag_norte_deg * 10.0f), (unsigned int)imu_mag_norte_ok,
+                 (long)(mv3[0] * 10.0f), (long)(mv3[1] * 10.0f), (long)(mv3[2] * 10.0f));
         EnviarMensajeDebug(linea);
     }
 }
@@ -1758,6 +1772,23 @@ static void ProcesarLineaAngulo(const volatile char *s, uint8_t len)
         ruta_rx_y[ruta_rx_head] = v[1];
         ruta_rx_head = sig;
     }
+    else if (s[0] == 'Q')
+    {
+        int32_t q[6];
+        for (i = 0U; i < 6U; i++)
+        {
+            if (LeerEnteroLinea(s, len, &pos, &q[i]) == 0U) return;
+            if (i < 5U)
+            {
+                if ((pos >= len) || (s[pos] != ',')) return;
+                pos++;
+            }
+        }
+        if (pos != len) return;
+        for (i = 3U; i < 6U; i++) if ((q[i] < 200) || (q[i] > 5000)) return;
+        for (i = 0U; i < 6U; i++) mag_rx_q[i] = q[i];
+        mag_rx_q_nuevo = 1U;
+    }
     else if ((s[0] == 'L') && (len == 2U) && ((s[1] == '0') || (s[1] == '1')))
     {
         log_rx = (s[1] == '1') ? 1U : 0U;
@@ -1976,6 +2007,11 @@ int main(void)
             EnviarMensajeDebug(diag_msg);
         }
         imuStatus = 1U;
+        {
+            const float off0[3] = {MAG_CANTO_OFF_X, MAG_CANTO_OFF_Y, MAG_CANTO_OFF_Z};
+            const float esc0[3] = {MAG_CANTO_ESC_X, MAG_CANTO_ESC_Y, MAG_CANTO_ESC_Z};
+            MPU9250_SetCorreccionCanto(off0, esc0);
+        }
         /* Giroscopio: medir el sesgo con el carro QUIETO (hasta 3 intentos). */
         if (MPU9250_GyroInit(&hi2c1) == HAL_OK)
         {
@@ -3308,6 +3344,24 @@ int main(void)
                 snprintf(m_r, sizeof(m_r), "RUTA: iniciada con %u puntos\r\n", (unsigned int)ruta_n);
                 EnviarMensajeDebug(m_r);
             }
+        }
+        if (mag_rx_q_nuevo != 0U)
+        {
+            float off[3];
+            float esc[3];
+            uint8_t k;
+            char m_q[90];
+            for (k = 0U; k < 3U; k++)
+            {
+                off[k] = (float)mag_rx_q[k] / 10.0f;
+                esc[k] = (float)mag_rx_q[k + 3U] / 1000.0f;
+            }
+            mag_rx_q_nuevo = 0U;
+            MPU9250_SetCorreccionCanto(off, esc);
+            snprintf(m_q, sizeof(m_q), "MAG: correccion de canto off=%ld,%ld,%ld esc=%ld,%ld,%ld\r\n",
+                     (long)mag_rx_q[0], (long)mag_rx_q[1], (long)mag_rx_q[2],
+                     (long)mag_rx_q[3], (long)mag_rx_q[4], (long)mag_rx_q[5]);
+            EnviarMensajeDebug(m_q);
         }
         if (log_rx != 0xFFU)
         {

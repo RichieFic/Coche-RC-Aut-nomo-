@@ -380,6 +380,9 @@ HAL_StatusTypeDef MPU9250_ReadHeading(I2C_HandleTypeDef *hi2c,
 static float eje_vertical[3] = {0.0f, 0.0f, 1.0f};
 /* Vertical completa (incluye Z) para el rumbo magnetico. */
 static float arriba_completo[3] = {0.0f, 0.0f, 1.0f};
+/* Correccion de canto (hard/soft iron en la posicion actual de la placa). */
+static float canto_off[3] = {0.0f, 0.0f, 0.0f};
+static float canto_esc[3] = {1.0f, 1.0f, 1.0f};
 static uint8_t arriba_medido = 0U;
 
 /* Reinicia la FIFO y la deja capturando los 3 ejes del giroscopio.
@@ -616,11 +619,8 @@ float MPU9250_HeadingInclinado(const MPU9250_Data_t *d, uint8_t *valido)
 
     *valido = 0U;
     if ((d == NULL) || (arriba_medido == 0U)) return 0.0f;
-    /* AK8963 -> ejes del MPU: X_mpu = Y_ak, Y_mpu = X_ak, Z_mpu = -Z_ak
-     * (mag_z_uT ya viene con el signo invertido). */
-    m[0] = d->mag_y_uT;
-    m[1] = d->mag_x_uT;
-    m[2] = d->mag_z_uT;
+    MPU9250_VectorMpu(d, m);
+    for (k = 0U; k < 3U; k++) m[k] = (m[k] - canto_off[k]) * canto_esc[k];
     for (k = 0U; k < 3U; k++) u[k] = arriba_completo[k];
 
     /* Eje de referencia: el eje del sensor mas horizontal. */
@@ -646,7 +646,26 @@ float MPU9250_HeadingInclinado(const MPU9250_Data_t *d, uint8_t *valido)
                    (h[0] * e1[0]) + (h[1] * e1[1]) + (h[2] * e1[2])) * RAD_TO_DEG;
     if (rumbo < 0.0f) rumbo += 360.0f;
     if (rumbo >= 360.0f) rumbo -= 360.0f;
-    *valido = ((n >= 10.0f) && (n <= 70.0f) &&
-               (d->mag_norm_uT >= 15.0f) && (d->mag_norm_uT <= 100.0f)) ? 1U : 0U;
+    /* Campo horizontal de la Tierra: ~27 uT en Monterrey. */
+    *valido = ((n >= 10.0f) && (n <= 70.0f)) ? 1U : 0U;
     return rumbo;
+}
+
+void MPU9250_VectorMpu(const MPU9250_Data_t *d, float m[3])
+{
+    /* AK8963 -> ejes del MPU: X_mpu = Y_ak, Y_mpu = X_ak, Z_mpu = -Z_ak
+     * (mag_z_uT ya viene con el signo invertido). */
+    m[0] = d->mag_y_uT;
+    m[1] = d->mag_x_uT;
+    m[2] = d->mag_z_uT;
+}
+
+void MPU9250_SetCorreccionCanto(const float off_uT[3], const float esc[3])
+{
+    uint8_t k;
+    for (k = 0U; k < 3U; k++)
+    {
+        canto_off[k] = off_uT[k];
+        canto_esc[k] = ((esc[k] > 0.2f) && (esc[k] < 5.0f)) ? esc[k] : 1.0f;
+    }
 }

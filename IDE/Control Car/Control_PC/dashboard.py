@@ -31,6 +31,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import control_carro as cc                     # noqa: E402  (puertos, Xbox, mezcla)
 import tema_oscuro as T                        # noqa: E402  (colores y componentes)
 import mapa_gps                                # noqa: E402  (pestana del mapa GPS)
+import calibrar_mag                            # noqa: E402  (magnetometro de canto)
 
 PERIODO_MS = 50                 # manejo y refresco de la ventana
 RASTRO_MAX = 3000
@@ -88,6 +89,7 @@ class Dashboard:
                               "w", encoding="utf-8", newline="\n")
         except (OSError, ValueError):
             pass
+        self.cal_mag = None                     # muestras durante la calibracion
         self.log_seq = None
         self.log_tramas = 0
         self.log_perdidas = 0
@@ -115,6 +117,9 @@ class Dashboard:
         threading.Thread(target=self.lector, daemon=True).start()
         self.escribir("#H1")
         self.escribir("#L1")                   # registro de entradas a 50 Hz
+        cal = calibrar_mag.cargar()            # correccion de canto guardada
+        if cal:
+            self.escribir(calibrar_mag.comando(*cal))
         self.root.after(PERIODO_MS, self.ciclo)
         if cerrar_en_ms:
             self.root.after(cerrar_en_ms, self.cerrar)
@@ -270,6 +275,7 @@ class Dashboard:
             e.pack(side="left", padx=(0, 8))
             self.k[nombre] = e
         ttk.Button(f2, text="Aplicar ganancias", command=self.enviar_ganancias).pack(side="left")
+        ttk.Button(f2, text="Calibrar magnetómetro", command=self.calibrar_magnetometro).pack(side="left", padx=6)
 
         msj = T.Panel(der, "Mensajes del carro")
         msj.pack(fill="both", expand=True, pady=(8, 0))
@@ -339,6 +345,44 @@ class Dashboard:
             return
         if -720 <= v <= 720:
             self.escribir(f"#A{int(round(v))}")
+
+    def calibrar_magnetometro(self):
+        """Una vuelta completa con el control de angulo, ajuste de la elipse y #Q."""
+        if self.cal_mag is not None:
+            return
+        self.manejo.set("apagado")
+        self.mensajes.append("MAG: calibrando... el carro va a dar una vuelta completa sobre su eje")
+        self.cal_mag = []
+        self.cal_inicio = time.monotonic()
+        self.escribir("#M0,0")
+        self.escribir("#CP")
+        self.escribir("#Z")
+        self.escribir("#A370")                 # + = derecha; un poco mas de una vuelta
+        self.root.after(500, self.revisar_calibracion)
+
+    def revisar_calibracion(self):
+        datos = list(self.cal_mag or [])
+        giro = (max(t for _, t in datos) - min(t for _, t in datos)) if datos else 0.0
+        quieto = bool(self.pose and abs(self.pose["v"]) < 0.01 and self.pose["rd"] == 0 and self.pose["ri"] == 0)
+        tiempo = time.monotonic() - self.cal_inicio
+        if not ((giro >= 360 and quieto) or tiempo > 45):
+            self.root.after(300, self.revisar_calibracion)
+            return
+        self.escribir("#CX")
+        self.cal_mag = None
+        if giro < 340 or len(datos) < 50:
+            self.mensajes.append(f"ERROR MAG: solo giro {giro:.0f} grados; repite la calibracion")
+            return
+        muestras = [m for m, _ in datos]
+        off, esc, ejes = calibrar_mag.ajustar(muestras)
+        _, rms, radio = calibrar_mag.calidad(muestras, [th for _, th in datos], off, esc, ejes)
+        self.mensajes.append(f"MAG: campo horizontal {radio:.1f} uT, error contra el giroscopio {rms:.1f} grados")
+        if rms > 15 or not (10 <= radio <= 70):
+            self.mensajes.append("ERROR MAG: la calibracion salio mala (¿metal cerca?); no se aplico")
+            return
+        calibrar_mag.guardar(off, esc, rms)
+        self.escribir(calibrar_mag.comando(off, esc))
+        self.mensajes.append("MAG: calibracion aplicada y guardada (se manda sola al conectar)")
 
     def enviar_ganancias(self):
         try:
@@ -536,6 +580,9 @@ class Dashboard:
             if "mg" in c:
                 try:
                     self.mag.append((t, int(c["mg"]) / 10.0, c.get("mv") == "1"))
+                    if self.cal_mag is not None and "mx" in c:
+                        self.cal_mag.append(((int(c["mx"]) / 10, int(c["my"]) / 10, int(c["mz"]) / 10),
+                                             int(c["th"]) / 10.0))
                 except ValueError:
                     pass
             self.pose = p

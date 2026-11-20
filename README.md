@@ -143,6 +143,7 @@ Mapa del campus con la posición GPS (punto amarillo, círculo de error según e
 - El carro navega con **encoders + giroscopio**; el GPS (±2–5 m) solo se muestra para comparar.
 - La X, el rumbo, la ruta y la imagen se guardan en `Control_PC/mapas/ruta_reto.json`.
 - La línea `P:` incluye `mg=` (rumbo magnético del frente en décimas de grado, horario desde el norte) y `mv=` (1 = válido). Se calcula proyectando el campo sobre el plano horizontal con la vertical del acelerómetro, así sirve con la IMU de canto; `MAG_OFFSET_DEG` corrige el desfase de montaje (ajustar en la prueba).
+- **Calibración de canto del magnetómetro** (aparte de `MPU9250_CalibrateMag`, que no cambia): el botón *Calibrar magnetómetro* (panel de control de ángulo) hace dar al carro una vuelta completa con el PID de ángulo, ajusta la elipse del campo horizontal (desviación fija del carro y diferencia de escalas) y la manda con `#Q off_x,off_y,off_z,esc_x,esc_y,esc_z` (0.1 µT, ×1000). Se guarda en `Control_PC/mapas/mag_canto.json` y el dashboard la vuelve a mandar al conectarse; sin ella el firmware usa la de `MAG_CANTO_*` (medida el 2026-11-20). La línea `P:` trae además `mx/my/mz` (campo en ejes del MPU, 0.1 µT). Sin ventana: `python calibrar_mag.py registros/crudo_<fecha>.log`.
 
 ### Control de ángulo en lazo cerrado
 
