@@ -118,7 +118,7 @@ Doble clic en **`IDE/Control Car/Control_PC/Iniciar dashboard.bat`** (o `python 
 
 El firmware manda la línea `P: x=… y=… th=… v=… rd=… ri=… pd=… pi=… us=… md=… wp=…` 10 veces por segundo (x, y en mm; th en décimas de grado, izquierda +). Comandos de ruta: `#WC` borrar, `#W<x_cm>,<y_cm>` agregar punto, `#WG` recorrer, `#WS` detener, `#O` reiniciar la odometría.
 
-La distancia sale de los encoders, así que la precisión de la ruta depende de que estén calibrados (`ODO_ESCALA_DER` / `ODO_ESCALA_IZQ` en `main.c`; calibración pendiente). El ángulo sale de `YawFuenteDeg()`, preparado para fusionarse más adelante con el magnetómetro y el GPS.
+La distancia sale de los encoders, así que la precisión de la ruta depende de que estén calibrados (`ODO_ESCALA_DER` / `ODO_ESCALA_IZQ` en `main.c` = 0.970, calibrado manejando 3 tramos de 5 m en el andador del reto). El ángulo sale de `YawFuenteDeg()`, preparado para fusionarse más adelante con el magnetómetro y el GPS.
 
 En cada punto intermedio el carro **frena y espera** (5 s por defecto, `#WE<ms>` lo cambia). El último punto es la meta: se llega frenando desde 60 cm y se exige a 5 cm (o en cuanto empieza a alejarse estando a menos de 15 cm), y el mensaje final dice a cuántos mm quedó según la odometría.
 

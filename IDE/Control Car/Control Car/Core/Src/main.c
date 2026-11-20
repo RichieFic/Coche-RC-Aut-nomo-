@@ -166,8 +166,8 @@ volatile uint8_t tele_rx_asistencia = 0U;
  * izquierda + (igual que yaw_gyro_deg). El angulo sale de YawFuenteDeg(), asi
  * que despues se puede cambiar o fusionar con magnetometro/GPS. */
 #define ODO_PERIODO_MS         20U
-#define ODO_ESCALA_DER         1.0f    /* correccion por rueda (calibracion de encoders, pendiente) */
-#define ODO_ESCALA_IZQ         1.0f
+#define ODO_ESCALA_DER         0.970f  /* calibrado 2026-11-20: 3 tramos de 5 m en el andador, real 4.80 m vs odometria 4.95 m */
+#define ODO_ESCALA_IZQ         0.970f
 #define ODO_TELEMETRIA_MS      100U
 float odo_x_m = 0.0f;
 float odo_y_m = 0.0f;
