@@ -73,6 +73,14 @@ HAL_StatusTypeDef MPU9250_DetectVertical(I2C_HandleTypeDef *hi2c, uint8_t usar_z
 /* Velocidad alrededor de la vertical (dps). Positivo = giro a la izquierda. */
 float MPU9250_GyroProject(const float xyz_dps[3]);
 
+/* Rumbo magnetico con la placa en cualquier posicion (plana o de canto):
+ * proyecta el campo sobre el plano horizontal usando la vertical medida por
+ * MPU9250_DetectVertical. Regresa grados [0, 360), sentido horario desde el
+ * norte magnetico, respecto a un eje fijo de la placa (el desfase de montaje
+ * se corrige en main.c con MAG_OFFSET_DEG). *valido = 0 si no hay vertical o
+ * si el campo horizontal esta fuera de rango. No usa ni cambia la calibracion. */
+float MPU9250_HeadingInclinado(const MPU9250_Data_t *d, uint8_t *valido);
+
 /* Promedia la velocidad proyectada durante ms milisegundos con el carro quieto.
  * Regresa HAL_ERROR si detecta movimiento (rango > 3 dps). */
 HAL_StatusTypeDef MPU9250_GyroCalibrateBias(I2C_HandleTypeDef *hi2c,

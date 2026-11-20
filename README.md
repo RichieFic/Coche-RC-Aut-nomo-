@@ -120,6 +120,22 @@ El firmware manda la línea `P: x=… y=… th=… v=… rd=… ri=… pd=… pi
 
 La distancia sale de los encoders, así que la precisión de la ruta depende de que estén calibrados (`ODO_ESCALA_DER` / `ODO_ESCALA_IZQ` en `main.c`; calibración pendiente). El ángulo sale de `YawFuenteDeg()`, preparado para fusionarse más adelante con el magnetómetro y el GPS.
 
+En cada punto intermedio el carro **frena y espera** (5 s por defecto, `#WE<ms>` lo cambia). El último punto es la meta: se llega frenando desde 60 cm y se exige a 5 cm (o en cuanto empieza a alejarse estando a menos de 15 cm), y el mensaje final dice a cuántos mm quedó según la odometría.
+
+#### Pestaña Mapa GPS (reto final)
+
+Mapa del campus con la posición GPS (punto amarillo, círculo de error según el HDOP, rastro), la ruta planeada y el carro estimado por la odometría.
+
+- **Fondo:** OpenStreetMap del Tec guardado en `Control_PC/mapas/osm/` (se descarga una vez con internet: botón *Descargar zona* o `python mapa_gps.py --descargar`), o **tu propia imagen** PNG con el norte arriba: *Cargar imagen…* y *Calibrar imagen* (clic en dos puntos y escribes su `latitud, longitud`, que Google Maps copia con clic derecho).
+- **Ruta del reto:**
+  1. *Marcar X* y clic exactamente en la salida.
+  2. Rumbo inicial del carro en la X: *Rumbo: magnetómetro* (carro quieto, promedia 3 s) o *Rumbo: marcar* (clic hacia donde apunta el frente).
+  3. Clic para los puntos del recorrido; con *Regresar a la X* la meta es la X.
+  4. Con el carro en la X, *Ejecutar desde la X*: reinicia la odometría y manda la ruta convertida a metros.
+- El carro navega con **encoders + giroscopio**; el GPS (±2–5 m) solo se muestra para comparar.
+- La X, el rumbo, la ruta y la imagen se guardan en `Control_PC/mapas/ruta_reto.json`.
+- La línea `P:` incluye `mg=` (rumbo magnético del frente en décimas de grado, horario desde el norte) y `mv=` (1 = válido). Se calcula proyectando el campo sobre el plano horizontal con la vertical del acelerómetro, así sirve con la IMU de canto; `MAG_OFFSET_DEG` corrige el desfase de montaje (ajustar en la prueba).
+
 ### Control de ángulo en lazo cerrado
 
 Es la opción **3** de `control_carro.py`, independiente de la evasión. El carro gira sobre su eje hasta el ángulo de referencia y lo mantiene, midiendo con el giroscopio 100 veces por segundo. Los ángulos son en grados, **positivos hacia la derecha**; el 0 es hacia donde apunta el carro al activar el modo.

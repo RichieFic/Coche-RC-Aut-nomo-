@@ -378,6 +378,9 @@ HAL_StatusTypeDef MPU9250_ReadHeading(I2C_HandleTypeDef *hi2c,
 /* Eje de giro "hacia arriba" en ejes del sensor (sale del acelerometro).
  * Por defecto Z, como si la placa estuviera plana. */
 static float eje_vertical[3] = {0.0f, 0.0f, 1.0f};
+/* Vertical completa (incluye Z) para el rumbo magnetico. */
+static float arriba_completo[3] = {0.0f, 0.0f, 1.0f};
+static uint8_t arriba_medido = 0U;
 
 /* Reinicia la FIFO y la deja capturando los 3 ejes del giroscopio.
  * USER_CTRL conserva I2C_MST_EN = 0 para no romper el bypass al AK8963. */
@@ -488,6 +491,8 @@ HAL_StatusTypeDef MPU9250_DetectVertical(I2C_HandleTypeDef *hi2c, uint8_t usar_z
     /* Con el carro quieto debe medir ~1 g. */
     if ((norma < 0.7f) || (norma > 1.3f)) return HAL_ERROR;
     for (k = 0U; k < 3U; k++) up[k] /= norma;
+    for (k = 0U; k < 3U; k++) arriba_completo[k] = up[k];
+    arriba_medido = 1U;
 
     /* Eje de giro = "arriba", pero sin el eje Z si esta danado. */
     eje_vertical[0] = up[0];
@@ -594,4 +599,54 @@ HAL_StatusTypeDef MPU9250_GyroReadDirect(I2C_HandleTypeDef *hi2c, float xyz_dps[
     if (mpu_read(hi2c, MPU_FIFO_COUNTH, cnt, 2U) != HAL_OK) return HAL_ERROR;
     *fifo_bytes = (uint16_t)(((uint16_t)(cnt[0] & 0x1FU) << 8) | cnt[1]);
     return HAL_OK;
+}
+
+float MPU9250_HeadingInclinado(const MPU9250_Data_t *d, uint8_t *valido)
+{
+    float m[3];
+    float u[3];
+    float e1[3];
+    float e2[3];
+    float h[3];
+    float pu;
+    float n;
+    float rumbo;
+    uint8_t k;
+    uint8_t ref = 0U;
+
+    *valido = 0U;
+    if ((d == NULL) || (arriba_medido == 0U)) return 0.0f;
+    /* AK8963 -> ejes del MPU: X_mpu = Y_ak, Y_mpu = X_ak, Z_mpu = -Z_ak
+     * (mag_z_uT ya viene con el signo invertido). */
+    m[0] = d->mag_y_uT;
+    m[1] = d->mag_x_uT;
+    m[2] = d->mag_z_uT;
+    for (k = 0U; k < 3U; k++) u[k] = arriba_completo[k];
+
+    /* Eje de referencia: el eje del sensor mas horizontal. */
+    if (fabsf(u[1]) < fabsf(u[ref])) ref = 1U;
+    if (fabsf(u[2]) < fabsf(u[ref])) ref = 2U;
+    for (k = 0U; k < 3U; k++) e1[k] = ((k == ref) ? 1.0f : 0.0f) - (u[ref] * u[k]);
+    n = sqrtf((e1[0] * e1[0]) + (e1[1] * e1[1]) + (e1[2] * e1[2]));
+    if (n < 0.5f) return 0.0f;
+    for (k = 0U; k < 3U; k++) e1[k] /= n;
+    /* e2 = arriba x e1 (90 grados a la izquierda de e1). */
+    e2[0] = (u[1] * e1[2]) - (u[2] * e1[1]);
+    e2[1] = (u[2] * e1[0]) - (u[0] * e1[2]);
+    e2[2] = (u[0] * e1[1]) - (u[1] * e1[0]);
+
+    /* Campo horizontal. */
+    pu = (m[0] * u[0]) + (m[1] * u[1]) + (m[2] * u[2]);
+    for (k = 0U; k < 3U; k++) h[k] = m[k] - (pu * u[k]);
+    n = sqrtf((h[0] * h[0]) + (h[1] * h[1]) + (h[2] * h[2]));
+
+    /* El norte esta a atan2(h.e2, h.e1) a la izquierda de e1, asi que e1
+     * apunta a ese mismo angulo en sentido horario desde el norte. */
+    rumbo = atan2f((h[0] * e2[0]) + (h[1] * e2[1]) + (h[2] * e2[2]),
+                   (h[0] * e1[0]) + (h[1] * e1[1]) + (h[2] * e1[2])) * RAD_TO_DEG;
+    if (rumbo < 0.0f) rumbo += 360.0f;
+    if (rumbo >= 360.0f) rumbo -= 360.0f;
+    *valido = ((n >= 10.0f) && (n <= 70.0f) &&
+               (d->mag_norm_uT >= 15.0f) && (d->mag_norm_uT <= 100.0f)) ? 1U : 0U;
+    return rumbo;
 }

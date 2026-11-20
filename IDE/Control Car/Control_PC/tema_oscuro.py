@@ -72,6 +72,10 @@ def aplicar_estilo(root):
     s.configure("Panel.TCheckbutton", background=PANEL)
     s.map("Panel.TCheckbutton", background=[("active", PANEL)])
     s.configure("TEntry", fieldbackground=PANEL_2, foreground=TEXTO, insertcolor=CIAN)
+    s.configure("TNotebook", background=PANEL, borderwidth=0, tabmargins=(8, 6, 8, 0))
+    s.configure("TNotebook.Tab", background=PANEL_2, foreground=TEXTO_TENUE, padding=(14, 4),
+                font=FUENTE_TITULO, borderwidth=0)
+    s.map("TNotebook.Tab", background=[("selected", BORDE)], foreground=[("selected", CIAN)])
 
 
 class Panel(tk.Frame):

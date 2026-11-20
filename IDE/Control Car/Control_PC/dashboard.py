@@ -30,6 +30,7 @@ from tkinter import ttk
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import control_carro as cc                     # noqa: E402  (puertos, Xbox, mezcla)
 import tema_oscuro as T                        # noqa: E402  (colores y componentes)
+import mapa_gps                                # noqa: E402  (pestana del mapa GPS)
 
 PERIODO_MS = 50                 # manejo y refresco de la ventana
 RASTRO_MAX = 3000
@@ -63,6 +64,8 @@ class Dashboard:
         self.rastro = collections.deque(maxlen=RASTRO_MAX)
         self.serie = collections.deque(maxlen=2000)   # (t, th, v, us, rpm promedio)
         self.gps = {"estado": "sin datos"}
+        self.gps_rastro = collections.deque(maxlen=3000)   # (lat, lon) con FIX
+        self.mag = collections.deque(maxlen=200)           # (t, rumbo magnetico, valido)
         self.rumbo_linea = ""
         self.ang_linea = ""
         self.mensajes = collections.deque(maxlen=300)
@@ -157,8 +160,14 @@ class Dashboard:
         cuerpo.pack(fill="both", expand=True, padx=12, pady=8)
 
         # ---------------- Izquierda: mapa y ruta
-        izq = T.Panel(cuerpo, "Mapa  //  odometría y ruta")
-        izq.pack(side="left", fill="both", expand=True)
+        panel_mapa = T.Panel(cuerpo, "Mapas  //  odometría y GPS")
+        panel_mapa.pack(side="left", fill="both", expand=True)
+        self.pestanas = ttk.Notebook(panel_mapa)
+        self.pestanas.pack(fill="both", expand=True, padx=4, pady=(2, 4))
+        izq = tk.Frame(self.pestanas, bg=T.PANEL)
+        self.pestanas.add(izq, text="ODOMETRÍA")
+        self.mapa_gps = mapa_gps.MapaGPS(self.pestanas, self)
+        self.pestanas.add(self.mapa_gps, text="MAPA GPS")
         botones = tk.Frame(izq, bg=T.PANEL)
         botones.pack(fill="x", padx=8, pady=4)
         ttk.Button(botones, text="▶ Ejecutar ruta", style="Accion.TButton",
@@ -324,6 +333,38 @@ class Dashboard:
         if all(0 <= v <= 99.99 for v in vals):
             self.escribir("#K{},{},{}".format(*(int(round(v * 100)) for v in vals)))
 
+    def gps_posicion(self):
+        if self.gps.get("FIX") != "1":
+            return None
+        try:
+            return float(self.gps["LAT"]), float(self.gps["LON"])
+        except (KeyError, ValueError):
+            return None
+
+    def ejecutar_ruta_odometria(self, puntos, espera_ms, reiniciar):
+        """Ruta ya en metros del marco de la odometria (desde el mapa GPS)."""
+        self.puntos = list(puntos[:20])
+        if reiniciar:
+            with self.datos_lock:
+                self.rastro.clear()
+            self.centro = [0.0, 0.0]
+
+        def tarea():
+            if reiniciar:
+                self.escribir("#O")
+                time.sleep(0.1)
+            self.escribir(f"#WE{espera_ms}")
+            time.sleep(0.05)
+            self.escribir("#WC")
+            time.sleep(0.05)
+            for (x, y) in self.puntos:
+                self.escribir(f"#W{int(round(x * 100))},{int(round(y * 100))}")
+                time.sleep(0.04)
+            time.sleep(0.05)
+            self.escribir("#WG")
+        self.manejo.set("apagado")
+        threading.Thread(target=tarea, daemon=True).start()
+
     # ---------------- ruta
     def ejecutar_ruta(self):
         if not self.puntos:
@@ -436,6 +477,11 @@ class Dashboard:
             except (KeyError, ValueError):
                 return
             t = time.monotonic() - self.t0
+            if "mg" in c:
+                try:
+                    self.mag.append((t, int(c["mg"]) / 10.0, c.get("mv") == "1"))
+                except ValueError:
+                    pass
             self.pose = p
             with self.datos_lock:
                 if not self.rastro or math.hypot(p["x"] - self.rastro[-1][0],
@@ -450,6 +496,9 @@ class Dashboard:
             c = dict(PATRON_CAMPOS.findall(resto))
             estado = "con posicion" if c.get("FIX") == "1" else resto.split(" ")[0].lower()
             self.gps = {"estado": estado, **c}
+            pos = self.gps_posicion()
+            if pos and (not self.gps_rastro or pos != self.gps_rastro[-1]):
+                self.gps_rastro.append(pos)
         elif texto.startswith("RUMBO:"):
             self.rumbo_linea = texto[6:].strip()
         elif texto.startswith("ANG: modo="):
@@ -656,7 +705,10 @@ class Dashboard:
         self.g_th.dibujar(t_fin, [(q[0], q[1]) for q in s])
         self.g_v.dibujar(t_fin, [(q[0], q[2]) for q in s])
         self.g_us.dibujar(t_fin, [(q[0], q[3]) for q in s if q[3] >= 0])
-        self.dibujar_mapa()
+        if self.pestanas.index("current") == 1:
+            self.mapa_gps.dibujar()
+        else:
+            self.dibujar_mapa()
 
         if self.mensajes:
             self.txt.config(state="normal")

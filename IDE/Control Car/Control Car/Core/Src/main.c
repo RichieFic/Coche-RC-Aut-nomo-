@@ -192,6 +192,21 @@ float us_ultima_cm = -1.0f;            /* ultima lectura del ultrasonico (-1 = s
 #define RUTA_AVANCE_MIN        30      /* % de velocidad al llegar a un punto */
 #define RUTA_FRENADO_M         0.30f   /* empieza a bajar la velocidad a esta distancia */
 #define RUTA_OBSTACULO_CM      20.0f   /* se pausa si hay algo a esta distancia o menos */
+#define RUTA_ESPERA_MS_DEF     5000U   /* espera en cada waypoint (#WE<ms> la cambia) */
+#define RUTA_LLEGADA_FINAL_M   0.05f   /* el ultimo punto (la meta) se exige mas fino */
+#define RUTA_FRENADO_FINAL_M   0.60f   /* ...y se llega frenando desde mas lejos */
+#define RUTA_PASADA_M          0.15f   /* si ya esta a menos de esto y se aleja, llego */
+/* Rumbo magnetico (IMU de canto): desfase entre el eje de referencia de la
+ * placa y el frente del carro, mas la declinacion. Se ajusta en la prueba. */
+#define MAG_OFFSET_DEG         0.0f
+uint32_t ruta_espera_ms = RUTA_ESPERA_MS_DEF;
+uint8_t ruta_esperando = 0U;
+uint32_t ruta_espera_desde = 0U;
+float ruta_dist_prev = 1000.0f;
+uint8_t ruta_alejando = 0U;
+volatile int32_t ruta_rx_espera = -1;
+float imu_mag_norte_deg = 0.0f;     /* rumbo del frente, horario desde el norte */
+uint8_t imu_mag_norte_ok = 0U;
 int32_t ruta_x_cm[RUTA_MAX_PUNTOS];
 int32_t ruta_y_cm[RUTA_MAX_PUNTOS];
 uint8_t ruta_n = 0U;
@@ -1347,13 +1362,15 @@ static void OdometriaPaso(void)
         char linea[160];
         odo_telemetria_ms = ahora;
         snprintf(linea, sizeof(linea),
-                 "P: x=%ld y=%ld th=%ld v=%ld rd=%ld ri=%ld pd=%ld pi=%ld us=%ld md=%s wp=%u/%u\r\n",
+                 "P: x=%ld y=%ld th=%ld v=%ld rd=%ld ri=%ld pd=%ld pi=%ld us=%ld md=%s wp=%u/%u"
+                 " mg=%ld mv=%u\r\n",
                  (long)(odo_x_m * 1000.0f), (long)(odo_y_m * 1000.0f),
                  (long)(odo_theta_deg * 10.0f), (long)(odo_v_ms * 1000.0f),
                  (long)(rpm_motor_derecho * 10.0f), (long)(rpm_motor_izquierdo * 10.0f),
                  (long)(pwm_actual_derecho * 10.0f), (long)(pwm_actual_izquierdo * 10.0f),
                  (long)(us_ultima_cm * 10.0f), ModoTexto(),
-                 (unsigned int)ruta_idx, (unsigned int)ruta_n);
+                 (unsigned int)ruta_idx, (unsigned int)ruta_n,
+                 (long)(imu_mag_norte_deg * 10.0f), (unsigned int)imu_mag_norte_ok);
         EnviarMensajeDebug(linea);
     }
 }
@@ -1367,6 +1384,7 @@ static void RutaPaso(void)
     float dist;
     float err_izq;
     float u;
+    uint8_t es_meta;
 
     if (ruta_activa == 0U) return;
     if ((ahora - ruta_ultimo_ms) < ANG_PERIODO_MS) return;
@@ -1382,25 +1400,65 @@ static void RutaPaso(void)
         return;
     }
 
+    /* Espera en el waypoint (parado). */
+    if (ruta_esperando != 0U)
+    {
+        if ((ahora - ruta_espera_desde) >= ruta_espera_ms)
+        {
+            char m[50];
+            ruta_esperando = 0U;
+            ruta_integral = 0.0f;
+            ruta_quieto = 0U;
+            ruta_girando = 0U;
+            snprintf(m, sizeof(m), "RUTA: sigo al punto %u\r\n", (unsigned int)(ruta_idx + 1U));
+            EnviarMensajeDebug(m);
+        }
+        return;
+    }
+
     dx = ((float)ruta_x_cm[ruta_idx] / 100.0f) - odo_x_m;
     dy = ((float)ruta_y_cm[ruta_idx] / 100.0f) - odo_y_m;
     dist = sqrtf((dx * dx) + (dy * dy));
+    es_meta = ((ruta_idx + 1U) >= ruta_n) ? 1U : 0U;
 
-    if (dist < RUTA_LLEGADA_M)
+    /* Meta: si ya estaba muy cerca y empieza a alejarse, ya paso por ella. */
+    if ((es_meta != 0U) && (dist < RUTA_PASADA_M) && (dist > (ruta_dist_prev + 0.003f)))
     {
-        char m[60];
+        ruta_alejando++;
+    }
+    else if (dist < ruta_dist_prev)
+    {
+        ruta_alejando = 0U;
+    }
+    ruta_dist_prev = dist;
+
+    if ((dist < ((es_meta != 0U) ? RUTA_LLEGADA_FINAL_M : RUTA_LLEGADA_M)) || (ruta_alejando >= 3U))
+    {
+        char m[80];
         ruta_idx++;
         ruta_integral = 0.0f;
         ruta_quieto = 0U;
         ruta_girando = 0U;
-        snprintf(m, sizeof(m), "RUTA: punto %u de %u alcanzado\r\n",
-                 (unsigned int)ruta_idx, (unsigned int)ruta_n);
-        EnviarMensajeDebug(m);
+        ruta_dist_prev = 1000.0f;
+        ruta_alejando = 0U;
+        StopMotors();
         if (ruta_idx >= ruta_n)
         {
-            StopMotors();
             ruta_activa = 0U;
-            EnviarMensajeDebug("RUTA: completada\r\n");
+            snprintf(m, sizeof(m), "RUTA: completada, a %ld mm de la meta (odometria)\r\n",
+                     (long)(dist * 1000.0f));
+            EnviarMensajeDebug(m);
+        }
+        else
+        {
+            snprintf(m, sizeof(m), "RUTA: punto %u de %u alcanzado, espero %lu ms\r\n",
+                     (unsigned int)ruta_idx, (unsigned int)ruta_n, (unsigned long)ruta_espera_ms);
+            EnviarMensajeDebug(m);
+            if (ruta_espera_ms > 0U)
+            {
+                ruta_esperando = 1U;
+                ruta_espera_desde = ahora;
+            }
         }
         return;
     }
@@ -1450,10 +1508,11 @@ static void RutaPaso(void)
     {
         int32_t avance = RUTA_AVANCE_MAX;
         float c = u * TELE_FACTOR_MOV;
-        if (dist < RUTA_FRENADO_M)
+        float frenado = (es_meta != 0U) ? RUTA_FRENADO_FINAL_M : RUTA_FRENADO_M;
+        if (dist < frenado)
         {
             avance = RUTA_AVANCE_MIN +
-                     (int32_t)((float)(RUTA_AVANCE_MAX - RUTA_AVANCE_MIN) * dist / RUTA_FRENADO_M);
+                     (int32_t)((float)(RUTA_AVANCE_MAX - RUTA_AVANCE_MIN) * dist / frenado);
         }
         if (c > TELE_CORR_MAX) c = TELE_CORR_MAX;
         if (c < -TELE_CORR_MAX) c = -TELE_CORR_MAX;
@@ -1588,6 +1647,14 @@ static void ProcesarLineaAngulo(const volatile char *s, uint8_t len)
     else if ((s[0] == 'W') && (len == 2U) && (s[1] == 'S'))
     {
         ruta_rx_detener = 1U;
+    }
+    else if ((s[0] == 'W') && (len > 2U) && (s[1] == 'E'))
+    {
+        /* Espera en cada waypoint: WE<ms> */
+        pos = 2U;
+        if (LeerEnteroLinea(s, len, &pos, &v[0]) == 0U) return;
+        if ((pos != len) || (v[0] < 0) || (v[0] > 30000)) return;
+        ruta_rx_espera = v[0];
     }
     else if (s[0] == 'W')
     {
@@ -2082,6 +2149,14 @@ int main(void)
                 last_imu_read_time = now_imu;
                 if (MPU9250_ReadHeading(&hi2c1, &imuData) == HAL_OK)
                 {
+                    {
+                        uint8_t mag_ok = 0U;
+                        float mag_n = MPU9250_HeadingInclinado(&imuData, &mag_ok) + MAG_OFFSET_DEG;
+                        while (mag_n >= 360.0f) mag_n -= 360.0f;
+                        while (mag_n < 0.0f) mag_n += 360.0f;
+                        imu_mag_norte_deg = mag_n;
+                        imu_mag_norte_ok = mag_ok;
+                    }
                     /* No aceptar rumbos calculados con campo horizontal casi nulo.
                        El umbral es diagnóstico/provisional; validar en el montaje real. */
                     float mag_xy = sqrtf(imuData.mag_x_uT * imuData.mag_x_uT +
@@ -3127,6 +3202,9 @@ int main(void)
                 joy_activo = 0U;
                 ruta_idx = 0U;
                 ruta_girando = 0U;
+                ruta_esperando = 0U;
+                ruta_dist_prev = 1000.0f;
+                ruta_alejando = 0U;
                 ruta_pausa_obstaculo = 0U;
                 ruta_integral = 0.0f;
                 ruta_quieto = 0U;
@@ -3135,6 +3213,15 @@ int main(void)
                 snprintf(m_r, sizeof(m_r), "RUTA: iniciada con %u puntos\r\n", (unsigned int)ruta_n);
                 EnviarMensajeDebug(m_r);
             }
+        }
+        if (ruta_rx_espera >= 0)
+        {
+            char m_e[50];
+            ruta_espera_ms = (uint32_t)ruta_rx_espera;
+            ruta_rx_espera = -1;
+            snprintf(m_e, sizeof(m_e), "RUTA: espera en cada punto = %lu ms\r\n",
+                     (unsigned long)ruta_espera_ms);
+            EnviarMensajeDebug(m_e);
         }
         if (ruta_rx_detener != 0U)
         {
