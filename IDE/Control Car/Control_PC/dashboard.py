@@ -32,6 +32,7 @@ import control_carro as cc                     # noqa: E402  (puertos, Xbox, mez
 import tema_oscuro as T                        # noqa: E402  (colores y componentes)
 import mapa_gps                                # noqa: E402  (pestana del mapa GPS)
 import calibrar_mag                            # noqa: E402  (magnetometro de canto)
+import curvas                                  # noqa: E402  (esquinas en curva)
 
 PERIODO_MS = 50                 # manejo y refresco de la ventana
 RASTRO_MAX = 3000
@@ -107,6 +108,9 @@ class Dashboard:
         self.seguir = tk.BooleanVar(master=self.root, value=True)
         self.modo_ang = tk.StringVar(master=self.root, value="PID")
         self.vel_ruta = tk.StringVar(master=self.root, value="80")   # % en recta
+        self.curvas = tk.BooleanVar(master=self.root, value=True)    # esquinas en curva
+        self.ruta_enviada = []                 # [(x, y, paso)] lo que se mando al carro
+        self.idx_parada = []                   # indice en ruta_enviada de cada punto del usuario
         self.escala = 120.0                    # pixeles por metro
         self.centro = [0.0, 0.0]               # punto del mundo al centro del mapa
 
@@ -194,6 +198,8 @@ class Dashboard:
         ttk.Button(botones, text="Reiniciar origen", command=self.reiniciar_origen).pack(side="left", padx=3)
         ttk.Checkbutton(botones, text="Seguir al carro", variable=self.seguir,
                         style="Panel.TCheckbutton").pack(side="left", padx=8)
+        ttk.Checkbutton(botones, text="Esquinas en curva", variable=self.curvas,
+                        style="Panel.TCheckbutton").pack(side="left", padx=(6, 0))
         ttk.Label(botones, text="Vel (%)").pack(side="left", padx=(6, 2))
         ttk.Entry(botones, width=4, textvariable=self.vel_ruta).pack(side="left")
         self.lbl_ruta = tk.Label(botones, text="0 PUNTOS", bg=T.PANEL, fg=T.ROSA,
@@ -417,23 +423,38 @@ class Dashboard:
             with self.datos_lock:
                 self.rastro.clear()
             self.centro = [0.0, 0.0]
+        self.enviar_ruta(self.puntos, espera_ms, reiniciar)
+
+    def ruta_a_enviar(self, puntos, inicio=None):
+        """Paradas del usuario -> lista para el carro (con arcos si esta activado)."""
+        if inicio is None:
+            inicio = (self.pose["x"], self.pose["y"]) if self.pose else (0.0, 0.0)
+        return curvas.ruta_con_curvas(inicio, puntos, curvas=self.curvas.get())
+
+    def enviar_ruta(self, puntos, espera_ms=None, reiniciar=False):
+        enviados, idx = self.ruta_a_enviar(puntos, (0.0, 0.0) if reiniciar else None)
+        self.ruta_enviada, self.idx_parada = enviados, idx
+        if len(puntos) and self.curvas.get():
+            pasos = sum(1 for p in enviados if p[2])
+            self.mensajes.append(f"RUTA: {len(puntos)} paradas + {pasos} puntos de curva")
 
         def tarea():
             if reiniciar:
                 self.escribir("#O")
                 time.sleep(0.1)
-            self.escribir(f"#WE{espera_ms}")
-            time.sleep(0.05)
+            if espera_ms is not None:
+                self.escribir(f"#WE{espera_ms}")
+                time.sleep(0.05)
             self.escribir(f"#WV{self.velocidad_ruta()}")
             time.sleep(0.05)
             self.escribir("#WC")
             time.sleep(0.05)
-            for (x, y) in self.puntos:
-                self.escribir(f"#W{int(round(x * 100))},{int(round(y * 100))}")
+            for (x, y, paso) in enviados:
+                self.escribir(f"#W{int(round(x * 100))},{int(round(y * 100))}" + (",1" if paso else ""))
                 time.sleep(0.04)
             time.sleep(0.05)
             self.escribir("#WG")
-        self.manejo.set("apagado")
+        self.manejo.set("apagado")             # que el manejo no le quite el control
         threading.Thread(target=tarea, daemon=True).start()
 
     def velocidad_ruta(self):
@@ -448,20 +469,7 @@ class Dashboard:
         if not self.puntos:
             self.mensajes.append("Agrega puntos en el mapa primero")
             return
-        puntos = list(self.puntos)
-
-        def tarea():
-            self.escribir(f"#WV{self.velocidad_ruta()}")
-            time.sleep(0.05)
-            self.escribir("#WC")
-            time.sleep(0.05)
-            for (x, y) in puntos[:20]:
-                self.escribir(f"#W{int(round(x * 100))},{int(round(y * 100))}")
-                time.sleep(0.04)
-            time.sleep(0.05)
-            self.escribir("#WG")
-        self.manejo.set("apagado")             # que el manejo no le quite el control
-        threading.Thread(target=tarea, daemon=True).start()
+        self.enviar_ruta(list(self.puntos[:20]))
 
     def quitar_punto(self):
         if self.puntos:
@@ -703,20 +711,26 @@ class Dashboard:
                 idx_actual = 0
         en_ruta = bool(self.pose and self.pose["md"] == "RUTA")
         if self.puntos:
-            # Desde donde esta el carro hasta el punto que sigue, y luego el resto
+            # Desde donde esta el carro por el camino que sigue (con las curvas)
             inicio = (self.pose["x"], self.pose["y"]) if self.pose else (0.0, 0.0)
-            pendientes = self.puntos[idx_actual:] if en_ruta else self.puntos
+            if en_ruta and self.ruta_enviada:
+                camino = [(x, y) for (x, y, _) in self.ruta_enviada[idx_actual:]]
+            else:
+                camino = [(x, y) for (x, y, _) in self.ruta_a_enviar(self.puntos, inicio)[0]]
             pts = list(self.a_pantalla(*inicio))
-            for (x, y) in pendientes:
+            for (x, y) in camino:
                 pts.extend(self.a_pantalla(x, y))
             if len(pts) >= 4:
                 c.create_line(*pts, fill=COLOR_RUTA, width=2, dash=(6, 4))
+            mapa_idx = self.idx_parada if (en_ruta and len(self.idx_parada) == len(self.puntos)) else None
             for n, (x, y) in enumerate(self.puntos):
                 sx, sy = self.a_pantalla(x, y)
-                hecho = en_ruta and n < idx_actual
+                k = mapa_idx[n] if mapa_idx else n
+                hecho = en_ruta and k < idx_actual
+                siguiente = en_ruta and not hecho and (n == 0 or (mapa_idx[n - 1] if mapa_idx else n - 1) < idx_actual)
                 color = COLOR_HECHO if hecho else COLOR_RUTA
-                r = 10 if (en_ruta and n == idx_actual) else 8
-                if en_ruta and n == idx_actual:
+                r = 10 if siguiente else 8
+                if siguiente:
                     c.create_oval(sx - r - 5, sy - r - 5, sx + r + 5, sy + r + 5,
                                   outline=T.mezclar(color, COLOR_MAPA, 0.4), width=2)
                 c.create_oval(sx - r, sy - r, sx + r, sy + r, outline=color, width=2,

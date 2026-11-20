@@ -171,6 +171,8 @@ class MapaGPS(tk.Frame):
         self.espera = ttk.Entry(b1, width=4)
         self.espera.insert(0, "5")
         self.espera.pack(side="left")
+        ttk.Checkbutton(b1, text="Curvas", variable=dash.curvas,
+                        style="Panel.TCheckbutton").pack(side="left", padx=(6, 0))
         ttk.Label(b1, text="Vel (%)").pack(side="left", padx=(6, 2))
         ttk.Entry(b1, width=4, textvariable=dash.vel_ruta).pack(side="left")
         ttk.Button(b1, text="▶ Ejecutar desde la X", style="Accion.TButton",
@@ -583,7 +585,8 @@ class MapaGPS(tk.Frame):
                     hechos = 0
             for n, p in enumerate(self.ruta):
                 sx, sy = self.a_pant(*p)
-                color = T.VERDE if n < hechos else T.ROSA
+                k = self.d.idx_parada[n] if n < len(self.d.idx_parada) else n
+                color = T.VERDE if (hechos and k < hechos) else T.ROSA
                 c.create_oval(sx - 9, sy - 9, sx + 9, sy + 9, outline=color, width=2,
                               fill=T.mezclar(color, "#081120", 0.35))
                 c.create_text(sx, sy, text=str(n + 1), fill="#ffffff", font=("Consolas", 8, "bold"))

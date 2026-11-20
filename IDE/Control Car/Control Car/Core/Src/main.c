@@ -195,7 +195,8 @@ float us_ultima_cm = -1.0f;            /* ultima lectura del ultrasonico (-1 = s
 /* ---- Ruta por puntos (path planner del dashboard) ----
  * #WC borrar puntos, #W<x_cm>,<y_cm> agregar punto (marco de la odometria),
  * #WG recorrer la ruta, #WS detener la ruta, #O reiniciar la odometria. */
-#define RUTA_MAX_PUNTOS        20U
+#define RUTA_MAX_PUNTOS        40U
+#define RUTA_PASO_M            0.15f   /* punto de paso: se da por pasado a esta distancia */
 #define RUTA_LLEGADA_M         0.10f   /* distancia para dar por alcanzado un punto */
 #define RUTA_GIRO_ENTRAR_DEG   30.0f   /* si el error de rumbo pasa de esto, gira sobre su eje */
 #define RUTA_GIRO_SALIR_DEG    3.0f    /* ...y vuelve a avanzar cuando baja de esto
@@ -242,6 +243,7 @@ float imu_mag_norte_deg = 0.0f;     /* rumbo del frente, horario desde el norte 
 uint8_t imu_mag_norte_ok = 0U;
 int32_t ruta_x_cm[RUTA_MAX_PUNTOS];
 int32_t ruta_y_cm[RUTA_MAX_PUNTOS];
+uint8_t ruta_paso[RUTA_MAX_PUNTOS];    /* 1 = punto de paso (curva): no frena ni espera */
 uint8_t ruta_n = 0U;
 uint8_t ruta_idx = 0U;
 uint8_t ruta_activa = 0U;
@@ -256,6 +258,7 @@ uint32_t ruta_ultimo_ms = 0U;
 #define RUTA_RX_COLA           8U
 volatile int32_t ruta_rx_x[RUTA_RX_COLA];
 volatile int32_t ruta_rx_y[RUTA_RX_COLA];
+volatile uint8_t ruta_rx_paso[RUTA_RX_COLA];
 volatile uint8_t ruta_rx_head = 0U;
 volatile uint8_t ruta_rx_tail = 0U;
 volatile uint8_t ruta_rx_borrar = 0U;
@@ -1451,7 +1454,9 @@ static void RutaPaso(void)
     float dist;
     float err_izq;
     float u;
+    float dist_parada;
     uint8_t es_meta;
+    uint8_t para_en_meta;
 
     if (ruta_activa == 0U) return;
     if ((ahora - ruta_ultimo_ms) < ANG_PERIODO_MS) return;
@@ -1489,8 +1494,43 @@ static void RutaPaso(void)
     dist = sqrtf((dx * dx) + (dy * dy));
     es_meta = ((ruta_idx + 1U) >= ruta_n) ? 1U : 0U;
 
-    /* Meta: si ya estaba muy cerca y empieza a alejarse, ya paso por ella. */
-    if ((es_meta != 0U) && (dist < RUTA_PASADA_M) && (dist > (ruta_dist_prev + 0.003f)))
+    /* Punto de paso (arco de una esquina): se da por pasado al acercarse o al
+     * rebasarlo sobre la linea del tramo; no frena ni espera. */
+    if ((ruta_paso[ruta_idx] != 0U) && (es_meta == 0U))
+    {
+        float lx = ((float)ruta_x_cm[ruta_idx] / 100.0f) - ruta_ax;
+        float ly = ((float)ruta_y_cm[ruta_idx] / 100.0f) - ruta_ay;
+        float largo = sqrtf((lx * lx) + (ly * ly));
+        float avance_linea = (largo > 0.01f)
+            ? ((((odo_x_m - ruta_ax) * lx) + ((odo_y_m - ruta_ay) * ly)) / largo) : largo;
+        if ((dist < RUTA_PASO_M) || (avance_linea >= largo))
+        {
+            ruta_ax = (float)ruta_x_cm[ruta_idx] / 100.0f;
+            ruta_ay = (float)ruta_y_cm[ruta_idx] / 100.0f;
+            ruta_idx++;
+            ruta_dist_prev = 1000.0f;
+            ruta_alejando = 0U;
+            return;
+        }
+    }
+
+    /* Distancia por el camino hasta la siguiente parada (para frenar a tiempo
+     * aunque antes haya puntos de paso). */
+    dist_parada = dist;
+    {
+        uint8_t k = ruta_idx;
+        while ((k + 1U < ruta_n) && (ruta_paso[k] != 0U))
+        {
+            float sx = (float)(ruta_x_cm[k + 1U] - ruta_x_cm[k]) / 100.0f;
+            float sy = (float)(ruta_y_cm[k + 1U] - ruta_y_cm[k]) / 100.0f;
+            dist_parada += sqrtf((sx * sx) + (sy * sy));
+            k++;
+        }
+        para_en_meta = ((k + 1U) >= ruta_n) ? 1U : 0U;
+    }
+
+    /* Parada: si ya estaba muy cerca y empieza a alejarse, ya paso por ella. */
+    if ((dist < RUTA_PASADA_M) && (dist > (ruta_dist_prev + 0.003f)))
     {
         ruta_alejando++;
     }
@@ -1500,7 +1540,9 @@ static void RutaPaso(void)
     }
     ruta_dist_prev = dist;
 
-    if ((dist < ((es_meta != 0U) ? RUTA_LLEGADA_FINAL_M : RUTA_LLEGADA_M)) || (ruta_alejando >= 3U))
+    /* Todas las paradas a 5 cm (antes 10 en las intermedias): en las curvas, parar
+     * 10 cm antes deja al carro fuera del arco y tendria que pivotar. */
+    if ((dist < RUTA_LLEGADA_FINAL_M) || (ruta_alejando >= 3U))
     {
         char m[80];
         ruta_ax = (float)ruta_x_cm[ruta_idx] / 100.0f;
@@ -1551,6 +1593,34 @@ static void RutaPaso(void)
             {
                 obj_dx = (ruta_ax + (lx * s_obj / largo)) - odo_x_m;
                 obj_dy = (ruta_ay + (ly * s_obj / largo)) - odo_y_m;
+            }
+            else if (ruta_paso[ruta_idx] != 0U)
+            {
+                /* El punto es de paso (curva): seguir midiendo por los tramos
+                 * siguientes hasta la proxima parada, para girar suave. */
+                float resto = s_obj - largo;
+                uint8_t k = ruta_idx;
+                float px = (float)ruta_x_cm[k] / 100.0f;
+                float py = (float)ruta_y_cm[k] / 100.0f;
+                while ((k + 1U) < ruta_n)
+                {
+                    float qx = (float)ruta_x_cm[k + 1U] / 100.0f;
+                    float qy = (float)ruta_y_cm[k + 1U] / 100.0f;
+                    float sl = sqrtf(((qx - px) * (qx - px)) + ((qy - py) * (qy - py)));
+                    if ((sl > 0.001f) && (resto < sl))
+                    {
+                        px += (qx - px) * resto / sl;
+                        py += (qy - py) * resto / sl;
+                        break;
+                    }
+                    resto -= sl;
+                    px = qx;
+                    py = qy;
+                    k++;
+                    if (ruta_paso[k] == 0U) break;   /* no pasar de una parada */
+                }
+                obj_dx = px - odo_x_m;
+                obj_dy = py - odo_y_m;
             }
         }
         /* + = el objetivo esta a la izquierda. */
@@ -1615,7 +1685,7 @@ static void RutaPaso(void)
         int32_t izq;
         int32_t der;
         uint32_t desde = ahora - ruta_tramo_ms;
-        float frenado = (es_meta != 0U) ? RUTA_FRENADO_FINAL_M : RUTA_FRENADO_M;
+        float frenado = (para_en_meta != 0U) ? RUTA_FRENADO_FINAL_M : RUTA_FRENADO_M;
         float c = (-RUTA_KP_LINEA * err_izq) + (RUTA_KD_LINEA * RateFuenteDps());
         /* Arranque suave: de RUTA_AVANCE_MIN a ruta_avance en RUTA_RAMPA_MS. */
         if (desde < RUTA_RAMPA_MS)
@@ -1623,10 +1693,10 @@ static void RutaPaso(void)
             avance = RUTA_AVANCE_MIN +
                      (int32_t)((float)(ruta_avance - RUTA_AVANCE_MIN) * (float)desde / (float)RUTA_RAMPA_MS);
         }
-        if (dist < frenado)
+        if (dist_parada < frenado)
         {
             int32_t fr = RUTA_AVANCE_MIN +
-                         (int32_t)((float)(ruta_avance - RUTA_AVANCE_MIN) * dist / frenado);
+                         (int32_t)((float)(ruta_avance - RUTA_AVANCE_MIN) * dist_parada / frenado);
             if (fr < avance) avance = fr;
         }
         if (c > RUTA_CORR_MAX_LINEA) c = RUTA_CORR_MAX_LINEA;
@@ -1786,16 +1856,23 @@ static void ProcesarLineaAngulo(const volatile char *s, uint8_t len)
     }
     else if (s[0] == 'W')
     {
-        /* Punto de la ruta: W<x_cm>,<y_cm> */
+        /* Punto de la ruta: W<x_cm>,<y_cm>[,1]   (,1 = punto de paso: no frena ni espera) */
         uint8_t sig = (uint8_t)((ruta_rx_head + 1U) % RUTA_RX_COLA);
+        v[2] = 0;
         if (LeerEnteroLinea(s, len, &pos, &v[0]) == 0U) return;
         if ((pos >= len) || (s[pos] != ',')) return;
         pos++;
         if (LeerEnteroLinea(s, len, &pos, &v[1]) == 0U) return;
+        if ((pos < len) && (s[pos] == ','))
+        {
+            pos++;
+            if (LeerEnteroLinea(s, len, &pos, &v[2]) == 0U) return;
+        }
         if (pos != len) return;
         if (sig == ruta_rx_tail) return;   /* cola llena */
         ruta_rx_x[ruta_rx_head] = v[0];
         ruta_rx_y[ruta_rx_head] = v[1];
+        ruta_rx_paso[ruta_rx_head] = (v[2] == 1) ? 1U : 0U;
         ruta_rx_head = sig;
     }
     else if ((s[0] == 'Q') && (len > 2U) && ((s[1] == 'O') || (s[1] == 'E')))
@@ -3335,6 +3412,7 @@ int main(void)
             {
                 ruta_x_cm[ruta_n] = ruta_rx_x[ruta_rx_tail];
                 ruta_y_cm[ruta_n] = ruta_rx_y[ruta_rx_tail];
+                ruta_paso[ruta_n] = ruta_rx_paso[ruta_rx_tail];
                 ruta_n++;
             }
             ruta_rx_tail = (uint8_t)((ruta_rx_tail + 1U) % RUTA_RX_COLA);
