@@ -105,6 +105,21 @@ Se abre con doble clic en **`Iniciar control.bat`** (o con `python control_carro
 - Si se cierra el programa o se corta la señal, el carro se detiene solo a los 0.3 s.
 - `--simular` prueba el control sin carro, mostrando lo que mandaría.
 
+### Dashboard (datos, mapa y ruta por puntos)
+
+Doble clic en **`IDE/Control Car/Control_PC/Iniciar dashboard.bat`** (o `python dashboard.py`). Pregunta la conexión y abre una ventana maximizada con:
+
+- **Mapa visto desde arriba:** posición del carro (odometría con encoders + giroscopio), su rastro y la ruta planeada. El carro arranca en (0, 0) mirando hacia arriba. Clic izquierdo agrega un punto, clic derecho quita el último y la rueda hace zoom.
+- **Ruta:** *Ejecutar ruta* manda los puntos (hasta 20) y el carro los recorre **solo**, en el firmware: gira hacia cada punto con el PID de ángulo, avanza corrigiendo el rumbo, frena al acercarse, da el punto por alcanzado a menos de 10 cm y se pausa si hay un obstáculo a 20 cm o menos. *Detener ruta*, *Borrar puntos* y *Reiniciar origen* (pone la posición en 0, 0).
+- **Datos en vivo:** modo, posición, rumbo, velocidad, RPM y PWM de cada rueda, obstáculo, punto de la ruta, asistencia de rumbo y GPS (estado, satélites, HDOP, coordenadas).
+- **Gráficas:** rumbo, velocidad y distancia al obstáculo de los últimos 20 s.
+- **Manejo:** apagado, teclado (W/A/S/D combinables, Q parar) o control de Xbox, más la asistencia de rumbo, el control de ángulo (referencia, PID u ON/OFF, ganancias) y **PARAR TODO** (también con Esc).
+- **Registro:** cada sesión se guarda en `Control_PC/registros/dashboard_<fecha>.csv`.
+
+El firmware manda la línea `P: x=… y=… th=… v=… rd=… ri=… pd=… pi=… us=… md=… wp=…` 10 veces por segundo (x, y en mm; th en décimas de grado, izquierda +). Comandos de ruta: `#WC` borrar, `#W<x_cm>,<y_cm>` agregar punto, `#WG` recorrer, `#WS` detener, `#O` reiniciar la odometría.
+
+La distancia sale de los encoders, así que la precisión de la ruta depende de que estén calibrados (`ODO_ESCALA_DER` / `ODO_ESCALA_IZQ` en `main.c`; calibración pendiente). El ángulo sale de `YawFuenteDeg()`, preparado para fusionarse más adelante con el magnetómetro y el GPS.
+
 ### Control de ángulo en lazo cerrado
 
 Es la opción **3** de `control_carro.py`, independiente de la evasión. El carro gira sobre su eje hasta el ángulo de referencia y lo mantiene, midiendo con el giroscopio 100 veces por segundo. Los ángulos son en grados, **positivos hacia la derecha**; el 0 es hacia donde apunta el carro al activar el modo.

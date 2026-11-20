@@ -160,6 +160,57 @@ uint32_t tele_ultimo_ms = 0U;
 uint32_t tele_telemetria_ms = 0U;
 volatile uint8_t tele_rx_asistencia_nuevo = 0U;
 volatile uint8_t tele_rx_asistencia = 0U;
+/* ---- Odometria: posicion (x, y) con encoders + angulo del giroscopio ----
+ * Marco: origen y direccion 0 = donde estaba el carro al arrancar o al
+ * mandar #O. x = hacia adelante, y = hacia la izquierda, theta en grados con
+ * izquierda + (igual que yaw_gyro_deg). El angulo sale de YawFuenteDeg(), asi
+ * que despues se puede cambiar o fusionar con magnetometro/GPS. */
+#define ODO_PERIODO_MS         20U
+#define ODO_ESCALA_DER         1.0f    /* correccion por rueda (calibracion de encoders, pendiente) */
+#define ODO_ESCALA_IZQ         1.0f
+#define ODO_TELEMETRIA_MS      100U
+float odo_x_m = 0.0f;
+float odo_y_m = 0.0f;
+float odo_theta_deg = 0.0f;
+float odo_theta0_deg = 0.0f;           /* YawFuenteDeg() que corresponde a theta = 0 */
+float odo_v_ms = 0.0f;                 /* velocidad de avance (con signo) */
+uint16_t odo_prev3 = 0U;               /* TIM3 = rueda derecha */
+uint16_t odo_prev4 = 0U;               /* TIM4 = rueda izquierda */
+uint32_t odo_ultimo_ms = 0U;
+uint32_t odo_telemetria_ms = 0U;
+uint8_t odo_iniciada = 0U;
+volatile uint8_t odo_rx_reset = 0U;
+float us_ultima_cm = -1.0f;            /* ultima lectura del ultrasonico (-1 = sin eco) */
+/* ---- Ruta por puntos (path planner del dashboard) ----
+ * #WC borrar puntos, #W<x_cm>,<y_cm> agregar punto (marco de la odometria),
+ * #WG recorrer la ruta, #WS detener la ruta, #O reiniciar la odometria. */
+#define RUTA_MAX_PUNTOS        20U
+#define RUTA_LLEGADA_M         0.10f   /* distancia para dar por alcanzado un punto */
+#define RUTA_GIRO_ENTRAR_DEG   30.0f   /* si el error de rumbo pasa de esto, gira sobre su eje */
+#define RUTA_GIRO_SALIR_DEG    8.0f    /* ...y vuelve a avanzar cuando baja de esto */
+#define RUTA_AVANCE_MAX        60      /* % de velocidad en recta */
+#define RUTA_AVANCE_MIN        30      /* % de velocidad al llegar a un punto */
+#define RUTA_FRENADO_M         0.30f   /* empieza a bajar la velocidad a esta distancia */
+#define RUTA_OBSTACULO_CM      20.0f   /* se pausa si hay algo a esta distancia o menos */
+int32_t ruta_x_cm[RUTA_MAX_PUNTOS];
+int32_t ruta_y_cm[RUTA_MAX_PUNTOS];
+uint8_t ruta_n = 0U;
+uint8_t ruta_idx = 0U;
+uint8_t ruta_activa = 0U;
+uint8_t ruta_girando = 0U;
+uint8_t ruta_pausa_obstaculo = 0U;
+float ruta_integral = 0.0f;
+uint8_t ruta_quieto = 0U;
+uint32_t ruta_ultimo_ms = 0U;
+/* Recibido por la interrupcion: cola corta de puntos y ordenes */
+#define RUTA_RX_COLA           8U
+volatile int32_t ruta_rx_x[RUTA_RX_COLA];
+volatile int32_t ruta_rx_y[RUTA_RX_COLA];
+volatile uint8_t ruta_rx_head = 0U;
+volatile uint8_t ruta_rx_tail = 0U;
+volatile uint8_t ruta_rx_borrar = 0U;
+volatile uint8_t ruta_rx_iniciar = 0U;
+volatile uint8_t ruta_rx_detener = 0U;
 /* DIAGNOSTICO temporal: letras sueltas recibidas por la ESP32 (USART3). */
 volatile uint8_t rx_esp_diag[8];
 volatile uint8_t rx_esp_diag_head = 0U;
@@ -1026,6 +1077,7 @@ static void DetenerTodo(void)
     boton_armado = 0U;
     ang_modo = ANG_MODO_APAGADO;
     ang_u = 0.0f;
+    ruta_activa = 0U;
 }
 /* ---------------- Control de angulo en lazo cerrado ---------------- */
 /* Angulo actual en la convencion del modo: grados, + = derecha. */
@@ -1229,6 +1281,185 @@ static void TelePaso(void)
         EnviarMensajeDebug(linea);
     }
 }
+/* ---------------- Odometria y telemetria P: para el dashboard ---------------- */
+static const char *ModoTexto(void)
+{
+    if (ruta_activa != 0U) return "RUTA";
+    if (ang_modo != ANG_MODO_APAGADO) return "ANGULO";
+    if (modo_automatico != 0U) return "EVASION";
+    if (yaw_turn_active != 0U) return "GIRO90";
+    if (joy_activo != 0U) return "CONTROL";
+    if (wasd_cmd != 0) return "WASD";
+    if ((pwm_actual_izquierdo > 0.0f) || (pwm_actual_derecho > 0.0f)) return "MOVIENDO";
+    return "QUIETO";
+}
+static float EnvolverDeg(float a)
+{
+    while (a > 180.0f) a -= 360.0f;
+    while (a < -180.0f) a += 360.0f;
+    return a;
+}
+/* Integra la posicion: distancia de los encoders (promedio con signo) y
+ * angulo de YawFuenteDeg(). Cada ODO_TELEMETRIA_MS manda la linea P:. */
+static void OdometriaPaso(void)
+{
+    uint32_t ahora = HAL_GetTick();
+    uint16_t c3;
+    uint16_t c4;
+    int16_t d3;
+    int16_t d4;
+    float dt;
+    float ds;
+    float th_nuevo;
+    float th_medio;
+
+    if (odo_iniciada == 0U)
+    {
+        odo_prev3 = (uint16_t)__HAL_TIM_GET_COUNTER(&htim3);
+        odo_prev4 = (uint16_t)__HAL_TIM_GET_COUNTER(&htim4);
+        odo_theta0_deg = YawFuenteDeg();
+        odo_ultimo_ms = ahora;
+        odo_iniciada = 1U;
+        return;
+    }
+    if ((ahora - odo_ultimo_ms) < ODO_PERIODO_MS) return;
+    dt = (float)(ahora - odo_ultimo_ms) / 1000.0f;
+    odo_ultimo_ms = ahora;
+
+    c3 = (uint16_t)__HAL_TIM_GET_COUNTER(&htim3);
+    c4 = (uint16_t)__HAL_TIM_GET_COUNTER(&htim4);
+    d3 = (int16_t)(c3 - odo_prev3);
+    d4 = (int16_t)(c4 - odo_prev4);
+    odo_prev3 = c3;
+    odo_prev4 = c4;
+
+    /* Adelante ambos encoders suben: el promedio con signo es el avance. */
+    ds = (((float)d3 * ODO_ESCALA_DER) + ((float)d4 * ODO_ESCALA_IZQ)) * 0.5f * distance_per_count;
+    th_nuevo = YawFuenteDeg() - odo_theta0_deg;
+    th_medio = ((odo_theta_deg + th_nuevo) * 0.5f) / 57.2957795f;
+    odo_x_m += ds * cosf(th_medio);
+    odo_y_m += ds * sinf(th_medio);
+    odo_theta_deg = th_nuevo;
+    if (dt > 0.0f) odo_v_ms = (0.7f * odo_v_ms) + (0.3f * (ds / dt));
+
+    if ((ahora - odo_telemetria_ms) >= ODO_TELEMETRIA_MS)
+    {
+        char linea[160];
+        odo_telemetria_ms = ahora;
+        snprintf(linea, sizeof(linea),
+                 "P: x=%ld y=%ld th=%ld v=%ld rd=%ld ri=%ld pd=%ld pi=%ld us=%ld md=%s wp=%u/%u\r\n",
+                 (long)(odo_x_m * 1000.0f), (long)(odo_y_m * 1000.0f),
+                 (long)(odo_theta_deg * 10.0f), (long)(odo_v_ms * 1000.0f),
+                 (long)(rpm_motor_derecho * 10.0f), (long)(rpm_motor_izquierdo * 10.0f),
+                 (long)(pwm_actual_derecho * 10.0f), (long)(pwm_actual_izquierdo * 10.0f),
+                 (long)(us_ultima_cm * 10.0f), ModoTexto(),
+                 (unsigned int)ruta_idx, (unsigned int)ruta_n);
+        EnviarMensajeDebug(linea);
+    }
+}
+/* ---------------- Seguimiento de la ruta por puntos ---------------- */
+static void RutaPaso(void)
+{
+    uint32_t ahora = HAL_GetTick();
+    float dt;
+    float dx;
+    float dy;
+    float dist;
+    float err_izq;
+    float u;
+
+    if (ruta_activa == 0U) return;
+    if ((ahora - ruta_ultimo_ms) < ANG_PERIODO_MS) return;
+    dt = (float)(ahora - ruta_ultimo_ms) / 1000.0f;
+    if (dt > 0.1f) dt = 0.1f;
+    ruta_ultimo_ms = ahora;
+
+    if (ruta_idx >= ruta_n)
+    {
+        StopMotors();
+        ruta_activa = 0U;
+        EnviarMensajeDebug("RUTA: completada\r\n");
+        return;
+    }
+
+    dx = ((float)ruta_x_cm[ruta_idx] / 100.0f) - odo_x_m;
+    dy = ((float)ruta_y_cm[ruta_idx] / 100.0f) - odo_y_m;
+    dist = sqrtf((dx * dx) + (dy * dy));
+
+    if (dist < RUTA_LLEGADA_M)
+    {
+        char m[60];
+        ruta_idx++;
+        ruta_integral = 0.0f;
+        ruta_quieto = 0U;
+        ruta_girando = 0U;
+        snprintf(m, sizeof(m), "RUTA: punto %u de %u alcanzado\r\n",
+                 (unsigned int)ruta_idx, (unsigned int)ruta_n);
+        EnviarMensajeDebug(m);
+        if (ruta_idx >= ruta_n)
+        {
+            StopMotors();
+            ruta_activa = 0U;
+            EnviarMensajeDebug("RUTA: completada\r\n");
+        }
+        return;
+    }
+
+    /* Error de rumbo hacia el punto: + = el punto esta a la izquierda. */
+    err_izq = EnvolverDeg((atan2f(dy, dx) * 57.2957795f) - odo_theta_deg);
+
+    /* Obstaculo enfrente al avanzar: pausar hasta que se despeje. */
+    if (ruta_girando == 0U)
+    {
+        uint8_t hay = ((us_ultima_cm >= 2.0f) && (us_ultima_cm <= RUTA_OBSTACULO_CM)) ? 1U : 0U;
+        if ((hay != 0U) && (ruta_pausa_obstaculo == 0U))
+        {
+            StopMotors();
+            ruta_pausa_obstaculo = 1U;
+            EnviarMensajeDebug("RUTA: obstaculo enfrente, en pausa\r\n");
+        }
+        else if ((ruta_pausa_obstaculo != 0U) &&
+                 ((us_ultima_cm < 0.0f) || (us_ultima_cm > (RUTA_OBSTACULO_CM + 5.0f))))
+        {
+            ruta_pausa_obstaculo = 0U;
+            EnviarMensajeDebug("RUTA: camino libre, continuo\r\n");
+        }
+        if (ruta_pausa_obstaculo != 0U) return;
+    }
+
+    /* Lejos del rumbo: girar sobre su eje; cerca: avanzar corrigiendo. */
+    if ((ruta_girando == 0U) && (fabsf(err_izq) > RUTA_GIRO_ENTRAR_DEG))
+    {
+        ruta_girando = 1U;
+        ruta_integral = 0.0f;
+        ruta_quieto = 0U;
+    }
+    if ((ruta_girando != 0U) && (fabsf(err_izq) < RUTA_GIRO_SALIR_DEG))
+    {
+        ruta_girando = 0U;
+        ruta_integral = 0.0f;
+        ruta_quieto = 0U;
+    }
+    /* PID de angulo en la convencion + = derecha. */
+    u = PidAngulo(-err_izq, -RateFuenteDps(), dt, &ruta_integral, &ruta_quieto);
+    if (ruta_girando != 0U)
+    {
+        AnguloAplicarSalida(u);
+    }
+    else
+    {
+        int32_t avance = RUTA_AVANCE_MAX;
+        float c = u * TELE_FACTOR_MOV;
+        if (dist < RUTA_FRENADO_M)
+        {
+            avance = RUTA_AVANCE_MIN +
+                     (int32_t)((float)(RUTA_AVANCE_MAX - RUTA_AVANCE_MIN) * dist / RUTA_FRENADO_M);
+        }
+        if (c > TELE_CORR_MAX) c = TELE_CORR_MAX;
+        if (c < -TELE_CORR_MAX) c = -TELE_CORR_MAX;
+        SetMotoresConSigno(avance + (int32_t)c, avance - (int32_t)c);
+    }
+}
 /* Inicia un tramo recto del rodeo (LATERAL, PASAR o REGRESO). */
 static void IniciarTramoEvasion(uint8_t fase)
 {
@@ -1341,6 +1572,36 @@ static void ProcesarLineaAngulo(const volatile char *s, uint8_t len)
     else if ((s[0] == 'Z') && (len == 1U))
     {
         ang_rx_cero = 1U;
+    }
+    else if ((s[0] == 'O') && (len == 1U))
+    {
+        odo_rx_reset = 1U;
+    }
+    else if ((s[0] == 'W') && (len == 2U) && (s[1] == 'C'))
+    {
+        ruta_rx_borrar = 1U;
+    }
+    else if ((s[0] == 'W') && (len == 2U) && (s[1] == 'G'))
+    {
+        ruta_rx_iniciar = 1U;
+    }
+    else if ((s[0] == 'W') && (len == 2U) && (s[1] == 'S'))
+    {
+        ruta_rx_detener = 1U;
+    }
+    else if (s[0] == 'W')
+    {
+        /* Punto de la ruta: W<x_cm>,<y_cm> */
+        uint8_t sig = (uint8_t)((ruta_rx_head + 1U) % RUTA_RX_COLA);
+        if (LeerEnteroLinea(s, len, &pos, &v[0]) == 0U) return;
+        if ((pos >= len) || (s[pos] != ',')) return;
+        pos++;
+        if (LeerEnteroLinea(s, len, &pos, &v[1]) == 0U) return;
+        if (pos != len) return;
+        if (sig == ruta_rx_tail) return;   /* cola llena */
+        ruta_rx_x[ruta_rx_head] = v[0];
+        ruta_rx_y[ruta_rx_head] = v[1];
+        ruta_rx_head = sig;
     }
     else if ((s[0] == 'H') && (len == 2U) && ((s[1] == '0') || (s[1] == '1')))
     {
@@ -1737,7 +1998,7 @@ int main(void)
                 "Especiales: F auto 2.5 m, R giro 90 derecha, I prueba lazo abierto 5 s\r\n"
                 "Boton azul: toque = giro R, mantener 1 s = modo F; en movimiento = STOP\r\n"
                 "G: ver los giros guardados en flash\r\n"
-                "Control de Xbox: programa control_xbox.py en la compu\r\n"
+                "Control de Xbox: programa control_carro.py; dashboard: dashboard.py\r\n"
                 "Encoders y sensor ultrasonico activos\r\n\r\n";
         EnviarMensajeDebug(mensaje_inicio);
     }
@@ -1758,7 +2019,7 @@ int main(void)
             uint32_t ahora_b = HAL_GetTick();
             uint8_t boton = (HAL_GPIO_ReadPin(B1_GPIO_Port, B1_Pin) == GPIO_PIN_RESET) ? 0U : 1U;
             uint8_t en_movimiento = ((modo_automatico != 0U) || (yaw_turn_active != 0U) ||
-                                     (ang_modo != ANG_MODO_APAGADO) ||
+                                     (ang_modo != ANG_MODO_APAGADO) || (ruta_activa != 0U) ||
                                      (wasd_cmd != 0) || (modo_lazo_abierto != 0U) ||
                                      (pwm_actual_izquierdo > 0.0f) || (pwm_actual_derecho > 0.0f))
                                     ? 1U : 0U;
@@ -2363,6 +2624,7 @@ int main(void)
         if (us_hay_medida != 0U)
         {
             obstaculo_manual = ((distancia_cm >= 2.0f) && (distancia_cm <= US_THRESHOLD_MANUAL_CM)) ? 1U : 0U;
+            us_ultima_cm = distancia_cm;
             if (distancia_cm >= 2.0f && distancia_cm <= US_THRESHOLD_CM)
             {
                 char mensaje_us[80];
@@ -2572,6 +2834,8 @@ int main(void)
                 __HAL_TIM_SET_COUNTER(&htim4, 0U);
                 enc_yaw_prev3 = 0U;   /* evita un salto en yaw_enc_deg */
                 enc_yaw_prev4 = 0U;
+                odo_prev3 = 0U;       /* la odometria tambien parte de 0 */
+                odo_prev4 = 0U;
                 encoder3_previous = 0U;
                 encoder4_previous = 0U;
                 encoder_distance_m = 0.0f;
@@ -2629,6 +2893,8 @@ int main(void)
                 __HAL_TIM_SET_COUNTER(&htim4, 0U);
                 enc_yaw_prev3 = 0U;   /* evita un salto en yaw_enc_deg */
                 enc_yaw_prev4 = 0U;
+                odo_prev3 = 0U;       /* la odometria tambien parte de 0 */
+                odo_prev4 = 0U;
                 encoder3_previous = 0U;
                 encoder4_previous = 0U;
                 encoder_distance_m = 0.0f;
@@ -2688,6 +2954,11 @@ int main(void)
                 ang_modo = ANG_MODO_APAGADO;
                 ang_u = 0.0f;
                 EnviarMensajeDebug("ANG: control de angulo apagado por un comando\r\n");
+            }
+            if (ruta_activa != 0U)
+            {
+                ruta_activa = 0U;     /* el comando recien aplicado manda */
+                EnviarMensajeDebug("RUTA: detenida por un comando\r\n");
             }
         }
         /* Control de angulo: aplicar lo recibido y dar un paso del controlador. */
@@ -2809,6 +3080,74 @@ int main(void)
                                                        : "ASISTENCIA DE RUMBO: OFF\r\n");
         }
         TelePaso();
+        /* Odometria y ruta por puntos (dashboard). */
+        if (odo_rx_reset != 0U)
+        {
+            odo_rx_reset = 0U;
+            odo_x_m = 0.0f;
+            odo_y_m = 0.0f;
+            odo_theta0_deg = YawFuenteDeg();
+            odo_theta_deg = 0.0f;
+            EnviarMensajeDebug("ODO: posicion reiniciada (0, 0, 0 grados)\r\n");
+        }
+        if (ruta_rx_borrar != 0U)
+        {
+            ruta_rx_borrar = 0U;
+            if (ruta_activa != 0U) StopMotors();
+            ruta_activa = 0U;
+            ruta_n = 0U;
+            ruta_idx = 0U;
+            EnviarMensajeDebug("RUTA: puntos borrados\r\n");
+        }
+        while (ruta_rx_tail != ruta_rx_head)
+        {
+            if (ruta_n < RUTA_MAX_PUNTOS)
+            {
+                ruta_x_cm[ruta_n] = ruta_rx_x[ruta_rx_tail];
+                ruta_y_cm[ruta_n] = ruta_rx_y[ruta_rx_tail];
+                ruta_n++;
+            }
+            ruta_rx_tail = (uint8_t)((ruta_rx_tail + 1U) % RUTA_RX_COLA);
+        }
+        if (ruta_rx_iniciar != 0U)
+        {
+            ruta_rx_iniciar = 0U;
+            if (ruta_n == 0U)
+            {
+                EnviarMensajeDebug("RUTA: no hay puntos\r\n");
+            }
+            else if (FuenteGiroOk() == 0U)
+            {
+                EnviarMensajeDebug("RUTA: no disponible (sin giroscopio)\r\n");
+            }
+            else
+            {
+                char m_r[50];
+                DetenerTodo();
+                joy_activo = 0U;
+                ruta_idx = 0U;
+                ruta_girando = 0U;
+                ruta_pausa_obstaculo = 0U;
+                ruta_integral = 0.0f;
+                ruta_quieto = 0U;
+                ruta_ultimo_ms = HAL_GetTick();
+                ruta_activa = 1U;
+                snprintf(m_r, sizeof(m_r), "RUTA: iniciada con %u puntos\r\n", (unsigned int)ruta_n);
+                EnviarMensajeDebug(m_r);
+            }
+        }
+        if (ruta_rx_detener != 0U)
+        {
+            ruta_rx_detener = 0U;
+            if (ruta_activa != 0U)
+            {
+                ruta_activa = 0U;
+                StopMotors();
+                EnviarMensajeDebug("RUTA: detenida\r\n");
+            }
+        }
+        OdometriaPaso();
+        RutaPaso();
         if ((joy_activo != 0U) && ((HAL_GetTick() - joy_ultimo_ms) > JOY_TIMEOUT_MS))
         {
             StopMotors();
