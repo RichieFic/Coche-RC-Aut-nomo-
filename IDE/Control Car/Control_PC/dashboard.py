@@ -93,6 +93,7 @@ class Dashboard:
         self.manejo = tk.StringVar(master=self.root, value="apagado")
         self.seguir = tk.BooleanVar(master=self.root, value=True)
         self.modo_ang = tk.StringVar(master=self.root, value="PID")
+        self.vel_ruta = tk.StringVar(master=self.root, value="80")   # % en recta
         self.escala = 120.0                    # pixeles por metro
         self.centro = [0.0, 0.0]               # punto del mundo al centro del mapa
 
@@ -178,6 +179,8 @@ class Dashboard:
         ttk.Button(botones, text="Reiniciar origen", command=self.reiniciar_origen).pack(side="left", padx=3)
         ttk.Checkbutton(botones, text="Seguir al carro", variable=self.seguir,
                         style="Panel.TCheckbutton").pack(side="left", padx=8)
+        ttk.Label(botones, text="Vel (%)").pack(side="left", padx=(6, 2))
+        ttk.Entry(botones, width=4, textvariable=self.vel_ruta).pack(side="left")
         self.lbl_ruta = tk.Label(botones, text="0 PUNTOS", bg=T.PANEL, fg=T.ROSA,
                                  font=("Consolas", 10, "bold"))
         self.lbl_ruta.pack(side="right")
@@ -355,6 +358,8 @@ class Dashboard:
                 time.sleep(0.1)
             self.escribir(f"#WE{espera_ms}")
             time.sleep(0.05)
+            self.escribir(f"#WV{self.velocidad_ruta()}")
+            time.sleep(0.05)
             self.escribir("#WC")
             time.sleep(0.05)
             for (x, y) in self.puntos:
@@ -365,6 +370,13 @@ class Dashboard:
         self.manejo.set("apagado")
         threading.Thread(target=tarea, daemon=True).start()
 
+    def velocidad_ruta(self):
+        try:
+            v = int(float(self.vel_ruta.get().replace(",", ".")))
+        except ValueError:
+            v = 80
+        return max(30, min(100, v))
+
     # ---------------- ruta
     def ejecutar_ruta(self):
         if not self.puntos:
@@ -373,6 +385,8 @@ class Dashboard:
         puntos = list(self.puntos)
 
         def tarea():
+            self.escribir(f"#WV{self.velocidad_ruta()}")
+            time.sleep(0.05)
             self.escribir("#WC")
             time.sleep(0.05)
             for (x, y) in puntos[:20]:

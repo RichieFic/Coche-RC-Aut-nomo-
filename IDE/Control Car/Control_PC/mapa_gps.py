@@ -171,6 +171,8 @@ class MapaGPS(tk.Frame):
         self.espera = ttk.Entry(b1, width=4)
         self.espera.insert(0, "5")
         self.espera.pack(side="left")
+        ttk.Label(b1, text="Vel (%)").pack(side="left", padx=(6, 2))
+        ttk.Entry(b1, width=4, textvariable=dash.vel_ruta).pack(side="left")
         ttk.Button(b1, text="▶ Ejecutar desde la X", style="Accion.TButton",
                    command=self.ejecutar).pack(side="right")
 

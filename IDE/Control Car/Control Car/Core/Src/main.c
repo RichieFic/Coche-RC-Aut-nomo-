@@ -188,18 +188,26 @@ float us_ultima_cm = -1.0f;            /* ultima lectura del ultrasonico (-1 = s
 #define RUTA_LLEGADA_M         0.10f   /* distancia para dar por alcanzado un punto */
 #define RUTA_GIRO_ENTRAR_DEG   30.0f   /* si el error de rumbo pasa de esto, gira sobre su eje */
 #define RUTA_GIRO_SALIR_DEG    8.0f    /* ...y vuelve a avanzar cuando baja de esto */
-#define RUTA_AVANCE_MAX        60      /* % de velocidad en recta */
+#define RUTA_AVANCE_DEF        80      /* % de velocidad en recta (#WV<%> la cambia) */
 #define RUTA_AVANCE_MIN        30      /* % de velocidad al llegar a un punto */
-#define RUTA_FRENADO_M         0.30f   /* empieza a bajar la velocidad a esta distancia */
+#define RUTA_FRENADO_M         0.50f   /* empieza a bajar la velocidad a esta distancia */
+#define RUTA_ADELANTE_M        0.50f   /* pure pursuit: apunta a esta distancia sobre la linea */
+#define RUTA_KP_LINEA          8.0f    /* avanzando: % de diferencia entre ruedas por grado */
+#define RUTA_KD_LINEA          0.15f   /* ...y por grado/s (amortigua) */
+#define RUTA_CORR_MAX_LINEA    35.0f   /* correccion maxima entre ruedas (%) */
 #define RUTA_OBSTACULO_CM      20.0f   /* se pausa si hay algo a esta distancia o menos */
 #define RUTA_ESPERA_MS_DEF     5000U   /* espera en cada waypoint (#WE<ms> la cambia) */
 #define RUTA_LLEGADA_FINAL_M   0.05f   /* el ultimo punto (la meta) se exige mas fino */
-#define RUTA_FRENADO_FINAL_M   0.60f   /* ...y se llega frenando desde mas lejos */
+#define RUTA_FRENADO_FINAL_M   0.80f   /* ...y se llega frenando desde mas lejos */
 #define RUTA_PASADA_M          0.15f   /* si ya esta a menos de esto y se aleja, llego */
 /* Rumbo magnetico (IMU de canto): desfase entre el eje de referencia de la
  * placa y el frente del carro, mas la declinacion. Se ajusta en la prueba. */
 #define MAG_OFFSET_DEG         0.0f
 uint32_t ruta_espera_ms = RUTA_ESPERA_MS_DEF;
+int32_t ruta_avance = RUTA_AVANCE_DEF;
+volatile int32_t ruta_rx_avance = -1;
+float ruta_ax = 0.0f;               /* inicio del tramo actual (m, marco de la odometria) */
+float ruta_ay = 0.0f;
 uint8_t ruta_esperando = 0U;
 uint32_t ruta_espera_desde = 0U;
 float ruta_dist_prev = 1000.0f;
@@ -1435,6 +1443,8 @@ static void RutaPaso(void)
     if ((dist < ((es_meta != 0U) ? RUTA_LLEGADA_FINAL_M : RUTA_LLEGADA_M)) || (ruta_alejando >= 3U))
     {
         char m[80];
+        ruta_ax = (float)ruta_x_cm[ruta_idx] / 100.0f;
+        ruta_ay = (float)ruta_y_cm[ruta_idx] / 100.0f;
         ruta_idx++;
         ruta_integral = 0.0f;
         ruta_quieto = 0U;
@@ -1463,8 +1473,29 @@ static void RutaPaso(void)
         return;
     }
 
-    /* Error de rumbo hacia el punto: + = el punto esta a la izquierda. */
-    err_izq = EnvolverDeg((atan2f(dy, dx) * 57.2957795f) - odo_theta_deg);
+    /* Pure pursuit: apuntar a un punto RUTA_ADELANTE_M mas adelante sobre la
+     * linea del tramo (inicio -> punto). Si el carro se desvia, regresa a la
+     * linea en vez de ir en diagonal al punto. Cerca del final apunta al punto. */
+    {
+        float lx = ((float)ruta_x_cm[ruta_idx] / 100.0f) - ruta_ax;
+        float ly = ((float)ruta_y_cm[ruta_idx] / 100.0f) - ruta_ay;
+        float largo = sqrtf((lx * lx) + (ly * ly));
+        float obj_dx = dx;
+        float obj_dy = dy;
+        if (largo > 0.05f)
+        {
+            float avance_linea = (((odo_x_m - ruta_ax) * lx) + ((odo_y_m - ruta_ay) * ly)) / largo;
+            float s_obj = avance_linea + RUTA_ADELANTE_M;
+            if (s_obj < RUTA_ADELANTE_M) s_obj = RUTA_ADELANTE_M;
+            if (s_obj < largo)
+            {
+                obj_dx = (ruta_ax + (lx * s_obj / largo)) - odo_x_m;
+                obj_dy = (ruta_ay + (ly * s_obj / largo)) - odo_y_m;
+            }
+        }
+        /* + = el objetivo esta a la izquierda. */
+        err_izq = EnvolverDeg((atan2f(obj_dy, obj_dx) * 57.2957795f) - odo_theta_deg);
+    }
 
     /* Obstaculo enfrente al avanzar: pausar hasta que se despeje. */
     if (ruta_girando == 0U)
@@ -1498,25 +1529,34 @@ static void RutaPaso(void)
         ruta_integral = 0.0f;
         ruta_quieto = 0U;
     }
-    /* PID de angulo en la convencion + = derecha. */
-    u = PidAngulo(-err_izq, -RateFuenteDps(), dt, &ruta_integral, &ruta_quieto);
     if (ruta_girando != 0U)
     {
+        /* Girando sobre su eje: PID de angulo (convencion + = derecha). */
+        u = PidAngulo(-err_izq, -RateFuenteDps(), dt, &ruta_integral, &ruta_quieto);
         AnguloAplicarSalida(u);
     }
     else
     {
-        int32_t avance = RUTA_AVANCE_MAX;
-        float c = u * TELE_FACTOR_MOV;
+        /* Avanzando: correccion continua, sin banda muerta.
+         * c > 0 = girar a la derecha (rueda izquierda mas rapida). */
+        int32_t avance = ruta_avance;
+        int32_t izq;
+        int32_t der;
         float frenado = (es_meta != 0U) ? RUTA_FRENADO_FINAL_M : RUTA_FRENADO_M;
+        float c = (-RUTA_KP_LINEA * err_izq) + (RUTA_KD_LINEA * RateFuenteDps());
         if (dist < frenado)
         {
             avance = RUTA_AVANCE_MIN +
-                     (int32_t)((float)(RUTA_AVANCE_MAX - RUTA_AVANCE_MIN) * dist / frenado);
+                     (int32_t)((float)(ruta_avance - RUTA_AVANCE_MIN) * dist / frenado);
         }
-        if (c > TELE_CORR_MAX) c = TELE_CORR_MAX;
-        if (c < -TELE_CORR_MAX) c = -TELE_CORR_MAX;
-        SetMotoresConSigno(avance + (int32_t)c, avance - (int32_t)c);
+        if (c > RUTA_CORR_MAX_LINEA) c = RUTA_CORR_MAX_LINEA;
+        if (c < -RUTA_CORR_MAX_LINEA) c = -RUTA_CORR_MAX_LINEA;
+        izq = avance + (int32_t)c;
+        der = avance - (int32_t)c;
+        /* Si una rueda pasa de 100 %, bajar las dos para conservar la diferencia. */
+        if (izq > 100) { der -= (izq - 100); izq = 100; }
+        if (der > 100) { izq -= (der - 100); der = 100; }
+        SetMotoresConSigno(izq, der);
     }
 }
 /* Inicia un tramo recto del rodeo (LATERAL, PASAR o REGRESO). */
@@ -1647,6 +1687,14 @@ static void ProcesarLineaAngulo(const volatile char *s, uint8_t len)
     else if ((s[0] == 'W') && (len == 2U) && (s[1] == 'S'))
     {
         ruta_rx_detener = 1U;
+    }
+    else if ((s[0] == 'W') && (len > 2U) && (s[1] == 'V'))
+    {
+        /* Velocidad de la ruta: WV<%> */
+        pos = 2U;
+        if (LeerEnteroLinea(s, len, &pos, &v[0]) == 0U) return;
+        if ((pos != len) || (v[0] < RUTA_AVANCE_MIN) || (v[0] > 100)) return;
+        ruta_rx_avance = v[0];
     }
     else if ((s[0] == 'W') && (len > 2U) && (s[1] == 'E'))
     {
@@ -3203,6 +3251,8 @@ int main(void)
                 ruta_idx = 0U;
                 ruta_girando = 0U;
                 ruta_esperando = 0U;
+                ruta_ax = odo_x_m;
+                ruta_ay = odo_y_m;
                 ruta_dist_prev = 1000.0f;
                 ruta_alejando = 0U;
                 ruta_pausa_obstaculo = 0U;
@@ -3213,6 +3263,14 @@ int main(void)
                 snprintf(m_r, sizeof(m_r), "RUTA: iniciada con %u puntos\r\n", (unsigned int)ruta_n);
                 EnviarMensajeDebug(m_r);
             }
+        }
+        if (ruta_rx_avance >= 0)
+        {
+            char m_v[50];
+            ruta_avance = ruta_rx_avance;
+            ruta_rx_avance = -1;
+            snprintf(m_v, sizeof(m_v), "RUTA: velocidad = %ld %%\r\n", (long)ruta_avance);
+            EnviarMensajeDebug(m_v);
         }
         if (ruta_rx_espera >= 0)
         {
