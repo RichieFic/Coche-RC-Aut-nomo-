@@ -198,7 +198,12 @@ float us_ultima_cm = -1.0f;            /* ultima lectura del ultrasonico (-1 = s
 #define RUTA_MAX_PUNTOS        20U
 #define RUTA_LLEGADA_M         0.10f   /* distancia para dar por alcanzado un punto */
 #define RUTA_GIRO_ENTRAR_DEG   30.0f   /* si el error de rumbo pasa de esto, gira sobre su eje */
-#define RUTA_GIRO_SALIR_DEG    8.0f    /* ...y vuelve a avanzar cuando baja de esto */
+#define RUTA_GIRO_SALIR_DEG    3.0f    /* ...y vuelve a avanzar cuando baja de esto
+                                          (antes 8: los ~16 grados restantes se hacian
+                                          acelerando en curva y derrapaba) */
+#define RUTA_PIVOTE_U_MAX      50.0f   /* pivote de la ruta: u max (PWM ~36 en vez de 42) */
+#define RUTA_ASENTAR_MS        300U    /* pausa despues de pivotar */
+#define RUTA_RAMPA_MS          600U    /* arranque suave de cada tramo */
 #define RUTA_AVANCE_DEF        80      /* % de velocidad en recta (#WV<%> la cambia) */
 #define RUTA_AVANCE_MIN        30      /* % de velocidad al llegar a un punto */
 #define RUTA_FRENADO_M         0.50f   /* empieza a bajar la velocidad a esta distancia */
@@ -242,6 +247,8 @@ uint8_t ruta_idx = 0U;
 uint8_t ruta_activa = 0U;
 uint8_t ruta_girando = 0U;
 uint8_t ruta_pausa_obstaculo = 0U;
+uint32_t ruta_asentar_hasta = 0U;      /* fin de la pausa despues de pivotar */
+uint32_t ruta_tramo_ms = 0U;           /* inicio del tramo (para el arranque suave) */
 float ruta_integral = 0.0f;
 uint8_t ruta_quieto = 0U;
 uint32_t ruta_ultimo_ms = 0U;
@@ -1467,6 +1474,7 @@ static void RutaPaso(void)
         {
             char m[50];
             ruta_esperando = 0U;
+            ruta_tramo_ms = ahora;
             ruta_integral = 0.0f;
             ruta_quieto = 0U;
             ruta_girando = 0U;
@@ -1563,6 +1571,7 @@ static void RutaPaso(void)
                  ((us_ultima_cm < 0.0f) || (us_ultima_cm > (RUTA_OBSTACULO_CM + 5.0f))))
         {
             ruta_pausa_obstaculo = 0U;
+            ruta_tramo_ms = ahora;     /* volver a arrancar suave */
             EnviarMensajeDebug("RUTA: camino libre, continuo\r\n");
         }
         if (ruta_pausa_obstaculo != 0U) return;
@@ -1577,15 +1586,26 @@ static void RutaPaso(void)
     }
     if ((ruta_girando != 0U) && (fabsf(err_izq) < RUTA_GIRO_SALIR_DEG))
     {
+        /* Termino de pivotar: parar y dejar que el carro se asiente. */
         ruta_girando = 0U;
         ruta_integral = 0.0f;
         ruta_quieto = 0U;
+        StopMotors();
+        ruta_asentar_hasta = ahora + RUTA_ASENTAR_MS;
+        ruta_tramo_ms = ruta_asentar_hasta;
     }
     if (ruta_girando != 0U)
     {
-        /* Girando sobre su eje: PID de angulo (convencion + = derecha). */
+        /* Girando sobre su eje: PID de angulo (convencion + = derecha),
+         * con la potencia limitada para que las ruedas derrapen menos. */
         u = PidAngulo(-err_izq, -RateFuenteDps(), dt, &ruta_integral, &ruta_quieto);
+        if (u > RUTA_PIVOTE_U_MAX) u = RUTA_PIVOTE_U_MAX;
+        if (u < -RUTA_PIVOTE_U_MAX) u = -RUTA_PIVOTE_U_MAX;
         AnguloAplicarSalida(u);
+    }
+    else if ((int32_t)(ruta_asentar_hasta - ahora) > 0)
+    {
+        /* Asentandose despues del pivote (motores ya parados). */
     }
     else
     {
@@ -1594,12 +1614,20 @@ static void RutaPaso(void)
         int32_t avance = ruta_avance;
         int32_t izq;
         int32_t der;
+        uint32_t desde = ahora - ruta_tramo_ms;
         float frenado = (es_meta != 0U) ? RUTA_FRENADO_FINAL_M : RUTA_FRENADO_M;
         float c = (-RUTA_KP_LINEA * err_izq) + (RUTA_KD_LINEA * RateFuenteDps());
-        if (dist < frenado)
+        /* Arranque suave: de RUTA_AVANCE_MIN a ruta_avance en RUTA_RAMPA_MS. */
+        if (desde < RUTA_RAMPA_MS)
         {
             avance = RUTA_AVANCE_MIN +
-                     (int32_t)((float)(ruta_avance - RUTA_AVANCE_MIN) * dist / frenado);
+                     (int32_t)((float)(ruta_avance - RUTA_AVANCE_MIN) * (float)desde / (float)RUTA_RAMPA_MS);
+        }
+        if (dist < frenado)
+        {
+            int32_t fr = RUTA_AVANCE_MIN +
+                         (int32_t)((float)(ruta_avance - RUTA_AVANCE_MIN) * dist / frenado);
+            if (fr < avance) avance = fr;
         }
         if (c > RUTA_CORR_MAX_LINEA) c = RUTA_CORR_MAX_LINEA;
         if (c < -RUTA_CORR_MAX_LINEA) c = -RUTA_CORR_MAX_LINEA;
@@ -3338,6 +3366,8 @@ int main(void)
                 ruta_integral = 0.0f;
                 ruta_quieto = 0U;
                 ruta_ultimo_ms = HAL_GetTick();
+                ruta_tramo_ms = ruta_ultimo_ms;
+                ruta_asentar_hasta = ruta_ultimo_ms;
                 ruta_activa = 1U;
                 snprintf(m_r, sizeof(m_r), "RUTA: iniciada con %u puntos\r\n", (unsigned int)ruta_n);
                 EnviarMensajeDebug(m_r);
