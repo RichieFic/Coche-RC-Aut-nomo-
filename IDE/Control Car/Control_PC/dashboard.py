@@ -117,9 +117,7 @@ class Dashboard:
         threading.Thread(target=self.lector, daemon=True).start()
         self.escribir("#H1")
         self.escribir("#L1")                   # registro de entradas a 50 Hz
-        cal = calibrar_mag.cargar()            # correccion de canto guardada
-        if cal:
-            self.escribir(calibrar_mag.comando(*cal))
+        self.enviar_configuracion()
         self.root.after(PERIODO_MS, self.ciclo)
         if cerrar_en_ms:
             self.root.after(cerrar_en_ms, self.cerrar)
@@ -346,18 +344,28 @@ class Dashboard:
         if -720 <= v <= 720:
             self.escribir(f"#A{int(round(v))}")
 
+    def enviar_configuracion(self):
+        """Lo que el carro debe tener activo. Se repite cuando el carro termina de
+        arrancar ("Carro listo"), porque si arranco despues de conectar se pierde."""
+        self.escribir("#H1" if self.asistencia else "#H0")
+        self.escribir("#L1")                   # registro de entradas a 50 Hz
+        cal = calibrar_mag.cargar()            # correccion de canto guardada
+        if cal:
+            for c in calibrar_mag.comando(*cal):
+                self.escribir(c)
+
     def calibrar_magnetometro(self):
         """Una vuelta completa con el control de angulo, ajuste de la elipse y #Q."""
         if self.cal_mag is not None:
             return
         self.manejo.set("apagado")
-        self.mensajes.append("MAG: calibrando... el carro va a dar una vuelta completa sobre su eje")
+        self.mensajes.append("MAG: calibrando... el carro va a dar dos vueltas sobre su eje")
         self.cal_mag = []
         self.cal_inicio = time.monotonic()
         self.escribir("#M0,0")
         self.escribir("#CP")
         self.escribir("#Z")
-        self.escribir("#A370")                 # + = derecha; un poco mas de una vuelta
+        self.escribir("#A720")                 # + = derecha; dos vueltas (mas muestras)
         self.root.after(500, self.revisar_calibracion)
 
     def revisar_calibracion(self):
@@ -365,7 +373,7 @@ class Dashboard:
         giro = (max(t for _, t in datos) - min(t for _, t in datos)) if datos else 0.0
         quieto = bool(self.pose and abs(self.pose["v"]) < 0.01 and self.pose["rd"] == 0 and self.pose["ri"] == 0)
         tiempo = time.monotonic() - self.cal_inicio
-        if not ((giro >= 360 and quieto) or tiempo > 45):
+        if not ((giro >= 700 and quieto) or tiempo > 60):
             self.root.after(300, self.revisar_calibracion)
             return
         self.escribir("#CX")
@@ -381,7 +389,8 @@ class Dashboard:
             self.mensajes.append("ERROR MAG: la calibracion salio mala (¿metal cerca?); no se aplico")
             return
         calibrar_mag.guardar(off, esc, rms)
-        self.escribir(calibrar_mag.comando(off, esc))
+        for c in calibrar_mag.comando(off, esc):
+            self.escribir(c)
         self.mensajes.append("MAG: calibracion aplicada y guardada (se manda sola al conectar)")
 
     def enviar_ganancias(self):
@@ -608,6 +617,9 @@ class Dashboard:
             self.ang_linea = texto[5:]
         elif texto.startswith(("DER:", "DIAG:", "DISTANCIA OBJETO")):
             pass
+        elif texto.startswith("Carro listo"):
+            self.mensajes.append(texto)
+            self.enviar_configuracion()
         elif texto.startswith(PREFIJOS_MENSAJE):
             self.mensajes.append(texto)
 

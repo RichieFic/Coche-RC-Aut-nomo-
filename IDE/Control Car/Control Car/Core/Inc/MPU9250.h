@@ -86,8 +86,9 @@ float MPU9250_HeadingInclinado(const MPU9250_Data_t *d, uint8_t *valido);
  * vuelta completa del carro (dashboard: "Calibrar magnetometro"). */
 void MPU9250_SetCorreccionCanto(const float off_uT[3], const float esc[3]);
 
-/* Campo magnetico en ejes del MPU (uT), con la calibracion original pero SIN
- * la correccion de canto: es lo que el dashboard usa para calcularla. */
+/* Campo magnetico en ejes del MPU (uT) a partir de las cuentas CRUDAS (solo la
+ * sensibilidad de fabrica ASA): no depende de la calibracion de arranque, que
+ * cambia cada vez que se enciende. Es lo que el dashboard usa para la de canto. */
 void MPU9250_VectorMpu(const MPU9250_Data_t *d, float m[3]);
 
 /* Promedia la velocidad proyectada durante ms milisegundos con el carro quieto.

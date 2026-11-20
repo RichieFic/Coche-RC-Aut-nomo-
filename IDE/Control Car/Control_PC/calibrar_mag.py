@@ -5,9 +5,12 @@ MPU9250_CalibrateMag del firmware).
 Con el carro dando una vuelta completa sobre su eje, el campo de la Tierra
 dibuja una elipse en el plano horizontal del sensor. Su centro es la
 desviacion fija del carro (hard iron) y la diferencia de radios es el soft
-iron. Se corrige con  m = (m - off) * esc  en ejes del MPU, igual que
-MPU9250_SetCorreccionCanto() en el firmware, y se manda con
-  #Q off_x,off_y,off_z,esc_x,esc_y,esc_z   (off en 0.1 uT, esc x1000)
+iron. Se corrige con  m = (m - off) * esc  en ejes del MPU (sobre las cuentas
+crudas, sin la calibracion de arranque), igual que MPU9250_SetCorreccionCanto()
+en el firmware, y se manda en dos lineas cortas (el puente ESP32 corta las
+lineas # a 20 caracteres):
+  #QO off_x,off_y,off_z   (0.1 uT)      #QE esc_x,esc_y,esc_z   (x1000)
+El hard iron depende del LUGAR (metal cercano): calibra donde vas a usarlo.
 
 Uso desde el dashboard: boton "Calibrar magnetometro".
 Uso sin ventana sobre un registro:  python calibrar_mag.py registros/crudo_<fecha>.log
@@ -72,17 +75,23 @@ def calidad(muestras, yaw_izq, off, esc, ejes_h):
 
 
 def comando(off, esc):
-    return "#Q{},{},{},{},{},{}".format(*(int(round(o * 10)) for o in off), *(int(round(e * 1000)) for e in esc))
+    """Las dos lineas que aplican la correccion en el carro."""
+    o = [max(-9999, min(9999, int(round(v * 10)))) for v in off]
+    e = [max(200, min(5000, int(round(v * 1000)))) for v in esc]
+    return ["#QO{},{},{}".format(*o), "#QE{},{},{}".format(*e)]
 
 
 def guardar(off, esc, rms):
     os.makedirs(os.path.dirname(ARCHIVO), exist_ok=True)
-    json.dump({"off_uT": off, "esc": esc, "error_deg": rms}, open(ARCHIVO, "w", encoding="utf-8"), indent=1)
+    json.dump({"version": 2, "off_uT": off, "esc": esc, "error_deg": rms},
+              open(ARCHIVO, "w", encoding="utf-8"), indent=1)
 
 
 def cargar():
     try:
         d = json.load(open(ARCHIVO, encoding="utf-8"))
+        if d.get("version") != 2:             # la v1 era sobre otros datos: no sirve
+            return None
         return d["off_uT"], d["esc"]
     except (OSError, ValueError, KeyError):
         return None
@@ -99,13 +108,13 @@ def leer_registro(ruta):
                 yaw = int(ln[2:].split(",")[4]) / 1000
             except (IndexError, ValueError):
                 pass
-        elif yaw is None:
-            continue
         elif ln.startswith("P:") and " mx=" in ln:
             c = dict(re.findall(r"(\w+)=(\S+)", ln))
+            if c.get("rd") == "0" and c.get("ri") == "0":
+                continue                      # solo mientras gira (cobertura pareja)
             p_m.append((int(c["mx"]) / 10, int(c["my"]) / 10, int(c["mz"]) / 10))
-            p_y.append(yaw)
-        elif ln.startswith("DER:"):
+            p_y.append(yaw if yaw is not None else int(c["th"]) / 10)
+        elif ln.startswith("DER:") and yaw is not None:
             r = re.search(r"MX=(\S+) MY=(\S+) MZ=(\S+) uT", ln)
             if r:
                 mx, my, mz = (float(v) for v in r.groups())
@@ -129,4 +138,4 @@ if __name__ == "__main__":
     print("off (uT):", [round(o, 1) for o in off], " esc:", [round(e, 3) for e in esc],
           " ejes horizontales:", "XYZ"[ejes[0]] + "XYZ"[ejes[1]])
     print(f"campo horizontal {radio:.1f} uT; contra el giroscopio: error RMS {rms:.1f} grados")
-    print("comando:", comando(off, esc))
+    print("comandos:", "  ".join(comando(off, esc)))

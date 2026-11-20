@@ -214,17 +214,15 @@ float us_ultima_cm = -1.0f;            /* ultima lectura del ultrasonico (-1 = s
 /* Rumbo magnetico (IMU de canto): desfase entre el eje de referencia de la
  * placa y el frente del carro, mas la declinacion. Se ajusta en la prueba. */
 #define MAG_OFFSET_DEG         0.0f
-/* Correccion de canto por omision (ejes del MPU, uT), medida el 2026-11-20
- * girando el carro a mano 4 x 90 grados. El dashboard manda una mejor con #Q
- * despues de "Calibrar magnetometro" (una vuelta completa). */
-#define MAG_CANTO_OFF_X        0.0f
-#define MAG_CANTO_OFF_Y        (-19.6f)
-#define MAG_CANTO_OFF_Z        110.8f
-#define MAG_CANTO_ESC_X        1.0f
-#define MAG_CANTO_ESC_Y        1.24f
-#define MAG_CANTO_ESC_Z        0.837f
+/* Correccion de canto (ejes del MPU, uT, sobre datos crudos). No hay valores
+ * por omision confiables (dependen del lugar): el rumbo magnetico es valido
+ * solo despues de que el dashboard manda la calibracion con
+ *   #QO<off_x>,<off_y>,<off_z>  (0.1 uT)   y   #QE<esc_x>,<esc_y>,<esc_z>  (x1000)
+ * (dos lineas cortas: el puente ESP32 corta las lineas # a 20 caracteres). */
 volatile int32_t mag_rx_q[6];
-volatile uint8_t mag_rx_q_nuevo = 0U;
+volatile uint8_t mag_rx_qo = 0U;
+volatile uint8_t mag_rx_qe = 0U;
+uint8_t mag_canto_ok = 0U;
 uint32_t ruta_espera_ms = RUTA_ESPERA_MS_DEF;
 int32_t ruta_avance = RUTA_AVANCE_DEF;
 volatile int32_t ruta_rx_avance = -1;
@@ -1772,22 +1770,27 @@ static void ProcesarLineaAngulo(const volatile char *s, uint8_t len)
         ruta_rx_y[ruta_rx_head] = v[1];
         ruta_rx_head = sig;
     }
-    else if (s[0] == 'Q')
+    else if ((s[0] == 'Q') && (len > 2U) && ((s[1] == 'O') || (s[1] == 'E')))
     {
-        int32_t q[6];
-        for (i = 0U; i < 6U; i++)
+        int32_t q[3];
+        uint8_t base = (s[1] == 'O') ? 0U : 3U;
+        pos = 2U;
+        for (i = 0U; i < 3U; i++)
         {
             if (LeerEnteroLinea(s, len, &pos, &q[i]) == 0U) return;
-            if (i < 5U)
+            if (i < 2U)
             {
                 if ((pos >= len) || (s[pos] != ',')) return;
                 pos++;
             }
         }
         if (pos != len) return;
-        for (i = 3U; i < 6U; i++) if ((q[i] < 200) || (q[i] > 5000)) return;
-        for (i = 0U; i < 6U; i++) mag_rx_q[i] = q[i];
-        mag_rx_q_nuevo = 1U;
+        if (base == 3U)
+        {
+            for (i = 0U; i < 3U; i++) if ((q[i] < 200) || (q[i] > 5000)) return;
+        }
+        for (i = 0U; i < 3U; i++) mag_rx_q[base + i] = q[i];
+        if (base == 0U) mag_rx_qo = 1U; else mag_rx_qe = 1U;
     }
     else if ((s[0] == 'L') && (len == 2U) && ((s[1] == '0') || (s[1] == '1')))
     {
@@ -2007,11 +2010,6 @@ int main(void)
             EnviarMensajeDebug(diag_msg);
         }
         imuStatus = 1U;
-        {
-            const float off0[3] = {MAG_CANTO_OFF_X, MAG_CANTO_OFF_Y, MAG_CANTO_OFF_Z};
-            const float esc0[3] = {MAG_CANTO_ESC_X, MAG_CANTO_ESC_Y, MAG_CANTO_ESC_Z};
-            MPU9250_SetCorreccionCanto(off0, esc0);
-        }
         /* Giroscopio: medir el sesgo con el carro QUIETO (hasta 3 intentos). */
         if (MPU9250_GyroInit(&hi2c1) == HAL_OK)
         {
@@ -2283,7 +2281,7 @@ int main(void)
                         while (mag_n >= 360.0f) mag_n -= 360.0f;
                         while (mag_n < 0.0f) mag_n += 360.0f;
                         imu_mag_norte_deg = mag_n;
-                        imu_mag_norte_ok = mag_ok;
+                        imu_mag_norte_ok = (mag_canto_ok != 0U) ? mag_ok : 0U;
                     }
                     /* No aceptar rumbos calculados con campo horizontal casi nulo.
                        El umbral es diagnóstico/provisional; validar en el montaje real. */
@@ -3345,7 +3343,7 @@ int main(void)
                 EnviarMensajeDebug(m_r);
             }
         }
-        if (mag_rx_q_nuevo != 0U)
+        if ((mag_rx_qo != 0U) && (mag_rx_qe != 0U))
         {
             float off[3];
             float esc[3];
@@ -3356,8 +3354,10 @@ int main(void)
                 off[k] = (float)mag_rx_q[k] / 10.0f;
                 esc[k] = (float)mag_rx_q[k + 3U] / 1000.0f;
             }
-            mag_rx_q_nuevo = 0U;
+            mag_rx_qo = 0U;
+            mag_rx_qe = 0U;
             MPU9250_SetCorreccionCanto(off, esc);
+            mag_canto_ok = 1U;
             snprintf(m_q, sizeof(m_q), "MAG: correccion de canto off=%ld,%ld,%ld esc=%ld,%ld,%ld\r\n",
                      (long)mag_rx_q[0], (long)mag_rx_q[1], (long)mag_rx_q[2],
                      (long)mag_rx_q[3], (long)mag_rx_q[4], (long)mag_rx_q[5]);

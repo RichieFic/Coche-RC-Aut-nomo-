@@ -653,11 +653,11 @@ float MPU9250_HeadingInclinado(const MPU9250_Data_t *d, uint8_t *valido)
 
 void MPU9250_VectorMpu(const MPU9250_Data_t *d, float m[3])
 {
-    /* AK8963 -> ejes del MPU: X_mpu = Y_ak, Y_mpu = X_ak, Z_mpu = -Z_ak
-     * (mag_z_uT ya viene con el signo invertido). */
-    m[0] = d->mag_y_uT;
-    m[1] = d->mag_x_uT;
-    m[2] = d->mag_z_uT;
+    /* AK8963 -> ejes del MPU: X_mpu = Y_ak, Y_mpu = X_ak, Z_mpu = -Z_ak.
+     * Cuentas crudas x 0.15 uT x ASA (sin offsets de la calibracion de arranque). */
+    m[0] = (float)d->mag_y_raw * 0.15f * asa_y;
+    m[1] = (float)d->mag_x_raw * 0.15f * asa_x;
+    m[2] = -(float)d->mag_z_raw * 0.15f * asa_z;
 }
 
 void MPU9250_SetCorreccionCanto(const float off_uT[3], const float esc[3])
