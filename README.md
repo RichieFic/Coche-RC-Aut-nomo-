@@ -122,6 +122,14 @@ La distancia sale de los encoders, así que la precisión de la ruta depende de 
 
 Avanzando sigue la **línea** entre puntos (pure pursuit: apunta 50 cm adelante sobre el tramo y regresa a la línea si se desvía) a 80 % por defecto (`#WV<%>` o el campo *Vel (%)* del dashboard). En cada punto intermedio el carro **frena y espera** (5 s por defecto, `#WE<ms>` lo cambia). El último punto es la meta: se llega frenando desde 80 cm y se exige a 5 cm (o en cuanto empieza a alejarse estando a menos de 15 cm), y el mensaje final dice a cuántos mm quedó según la odometría.
 
+#### Registro de entradas y replay de la odometría (estilo AdvantageKit)
+
+- Al conectarse, el dashboard manda `#L1` y el firmware envía en cada paso de la odometría (50 Hz) una línea con las **entradas crudas** y la pose que calculó:
+  `L:seq,t_ms,cnt_der,cnt_izq,yaw_mdeg,rate_cdps,us_mm,pwm_izq_x10,pwm_der_x10,modo,wp,reinicios,x_mm,y_mm,th_cdeg*CK` (CK = XOR de los caracteres). `#L0` lo apaga.
+- Todo lo que llega se guarda en `Control_PC/registros/crudo_<fecha>.log`; la barra inferior muestra cuántas tramas llegaron y cuántas se perdieron.
+- `python replay_odometria.py registros/crudo_<fecha>.log` vuelve a correr `OdometriaPaso()` sin ventana: primero verifica que con las mismas constantes da la misma pose, y luego permite probar otras (`--escala`, `--escala-der/--escala-izq`, `--yaw-encoders`), barridos en paralelo (`--barrido 0.94:1.00:0.005 --jobs 8`) y exportar a AdvantageScope (`--advantagescope salida.csv`).
+- El replay cambia la **estimación**, no el movimiento: para saber cómo se habría movido el carro con otra ganancia hace falta la simulación (fases siguientes).
+
 #### Pestaña Mapa GPS (reto final)
 
 Mapa del campus con la posición GPS (punto amarillo, círculo de error según el HDOP, rastro), la ruta planeada y el carro estimado por la odometría.

@@ -179,6 +179,17 @@ uint16_t odo_prev4 = 0U;               /* TIM4 = rueda izquierda */
 uint32_t odo_ultimo_ms = 0U;
 uint32_t odo_telemetria_ms = 0U;
 uint8_t odo_iniciada = 0U;
+/* Registro de entradas para replay/simulacion en la PC (estilo AdvantageKit):
+ * en cada paso de la odometria manda una linea
+ *   L:seq,t_ms,cnt_der,cnt_izq,yaw_mdeg,rate_cdps,us_mm,pwm_izq_x10,pwm_der_x10,
+ *     modo,wp,reinicios,x_mm,y_mm,th_cdeg*CK
+ * con los contadores CRUDOS y el angulo que uso la odometria, mas la pose que
+ * resulto (para verificar el replay). CK = XOR de los caracteres entre "L:" y "*".
+ * #L1 lo activa, #L0 lo apaga (apagado al arrancar). */
+uint8_t log_entradas = 0U;
+uint16_t log_seq = 0U;
+uint8_t odo_reinicios = 0U;            /* cuantas veces se reinicio la odometria (#O) */
+volatile uint8_t log_rx = 0xFFU;       /* 0/1 recibido por la interrupcion */
 volatile uint8_t odo_rx_reset = 0U;
 float us_ultima_cm = -1.0f;            /* ultima lectura del ultrasonico (-1 = sin eco) */
 /* ---- Ruta por puntos (path planner del dashboard) ----
@@ -1365,6 +1376,35 @@ static void OdometriaPaso(void)
     odo_theta_deg = th_nuevo;
     if (dt > 0.0f) odo_v_ms = (0.7f * odo_v_ms) + (0.3f * (ds / dt));
 
+    if (log_entradas != 0U)
+    {
+        char l[140];
+        int n;
+        int k;
+        uint8_t ck = 0U;
+        /* Sentido de cada rueda segun los pines del puente H. */
+        int32_t s_izq = (HAL_GPIO_ReadPin(IN2_GPIO_Port, IN2_Pin) == GPIO_PIN_SET) ? 1 :
+                        ((HAL_GPIO_ReadPin(GPIOA, In1_Pin) == GPIO_PIN_SET) ? -1 : 0);
+        int32_t s_der = (HAL_GPIO_ReadPin(GPIOA, IN3_Pin) == GPIO_PIN_SET) ? 1 :
+                        ((HAL_GPIO_ReadPin(GPIOA, IN4_Pin) == GPIO_PIN_SET) ? -1 : 0);
+        log_seq++;
+        n = snprintf(l, sizeof(l), "L:%u,%lu,%u,%u,%ld,%ld,%ld,%ld,%ld,%c,%u,%u,%ld,%ld,%ld",
+                     (unsigned int)log_seq, (unsigned long)ahora, (unsigned int)c3, (unsigned int)c4,
+                     (long)(YawFuenteDeg() * 1000.0f), (long)(RateFuenteDps() * 100.0f),
+                     (long)(us_ultima_cm * 10.0f),
+                     (long)(s_izq * (int32_t)(pwm_actual_izquierdo * 10.0f)),
+                     (long)(s_der * (int32_t)(pwm_actual_derecho * 10.0f)),
+                     ModoTexto()[0], (unsigned int)ruta_idx, (unsigned int)odo_reinicios,
+                     (long)(odo_x_m * 1000.0f), (long)(odo_y_m * 1000.0f),
+                     (long)(odo_theta_deg * 100.0f));
+        if ((n > 2) && (n < (int)sizeof(l) - 6))
+        {
+            for (k = 2; k < n; k++) ck ^= (uint8_t)l[k];
+            snprintf(&l[n], sizeof(l) - (size_t)n, "*%02X\r\n", (unsigned int)ck);
+            EnviarMensajeDebug(l);
+        }
+    }
+
     if ((ahora - odo_telemetria_ms) >= ODO_TELEMETRIA_MS)
     {
         char linea[160];
@@ -1717,6 +1757,10 @@ static void ProcesarLineaAngulo(const volatile char *s, uint8_t len)
         ruta_rx_x[ruta_rx_head] = v[0];
         ruta_rx_y[ruta_rx_head] = v[1];
         ruta_rx_head = sig;
+    }
+    else if ((s[0] == 'L') && (len == 2U) && ((s[1] == '0') || (s[1] == '1')))
+    {
+        log_rx = (s[1] == '1') ? 1U : 0U;
     }
     else if ((s[0] == 'H') && (len == 2U) && ((s[1] == '0') || (s[1] == '1')))
     {
@@ -3211,6 +3255,7 @@ int main(void)
             odo_y_m = 0.0f;
             odo_theta0_deg = YawFuenteDeg();
             odo_theta_deg = 0.0f;
+            odo_reinicios++;
             EnviarMensajeDebug("ODO: posicion reiniciada (0, 0, 0 grados)\r\n");
         }
         if (ruta_rx_borrar != 0U)
@@ -3263,6 +3308,13 @@ int main(void)
                 snprintf(m_r, sizeof(m_r), "RUTA: iniciada con %u puntos\r\n", (unsigned int)ruta_n);
                 EnviarMensajeDebug(m_r);
             }
+        }
+        if (log_rx != 0xFFU)
+        {
+            log_entradas = log_rx;
+            log_rx = 0xFFU;
+            EnviarMensajeDebug((log_entradas != 0U) ? "LOG: registro de entradas ON (50 Hz)\r\n"
+                                                    : "LOG: registro de entradas OFF\r\n");
         }
         if (ruta_rx_avance >= 0)
         {

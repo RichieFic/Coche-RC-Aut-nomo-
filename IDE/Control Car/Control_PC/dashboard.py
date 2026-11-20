@@ -80,6 +80,17 @@ class Dashboard:
         self.asistencia = True
 
         self.csv_ruta, self.csv = self.abrir_csv()
+        # Registro crudo: TODAS las lineas del carro, incluidas las L: (entradas
+        # a 50 Hz para replay/simulacion: ver replay_odometria.py)
+        self.crudo = None
+        try:
+            self.crudo = open(self.csv_ruta.replace("dashboard_", "crudo_").replace(".csv", ".log"),
+                              "w", encoding="utf-8", newline="\n")
+        except (OSError, ValueError):
+            pass
+        self.log_seq = None
+        self.log_tramas = 0
+        self.log_perdidas = 0
 
         self.root = tk.Tk()
         self.root.title(f"Dashboard - Carro autonomo ({nombre_conexion})")
@@ -103,6 +114,7 @@ class Dashboard:
 
         threading.Thread(target=self.lector, daemon=True).start()
         self.escribir("#H1")
+        self.escribir("#L1")                   # registro de entradas a 50 Hz
         self.root.after(PERIODO_MS, self.ciclo)
         if cerrar_en_ms:
             self.root.after(cerrar_en_ms, self.cerrar)
@@ -272,8 +284,9 @@ class Dashboard:
         self.lbl_ticker = tk.Label(pie, text="▸ Listo", bg=T.PANEL, fg=T.CIAN,
                                    font=T.FUENTE_MONO_P, anchor="w")
         self.lbl_ticker.pack(side="left", fill="x", expand=True, padx=10, pady=3)
-        tk.Label(pie, text=f"REGISTRO: {os.path.basename(self.csv_ruta)}", bg=T.PANEL,
-                 fg=T.TEXTO_TENUE, font=T.FUENTE_MONO_P).pack(side="right", padx=10)
+        self.lbl_registro = tk.Label(pie, text=f"REGISTRO: {os.path.basename(self.csv_ruta)}",
+                                     bg=T.PANEL, fg=T.TEXTO_TENUE, font=T.FUENTE_MONO_P)
+        self.lbl_registro.pack(side="right", padx=10)
 
     # ================================================================ envio
     def escribir(self, linea):
@@ -477,10 +490,39 @@ class Dashboard:
             if len(resto) > 8192:
                 resto = b""
 
+    def contar_trama(self, texto):
+        """Revisa el XOR y si se perdieron tramas (saltos en seq)."""
+        try:
+            cuerpo, ck = texto[2:].rsplit("*", 1)
+            x = 0
+            for ch in cuerpo:
+                x ^= ord(ch)
+            if x != int(ck, 16):
+                self.log_perdidas += 1
+                return
+            seq = int(cuerpo.split(",", 1)[0])
+        except ValueError:
+            self.log_perdidas += 1
+            return
+        if self.log_seq is not None:
+            salto = (seq - self.log_seq) % 65536
+            if 1 < salto < 1000:
+                self.log_perdidas += salto - 1
+        self.log_seq = seq
+        self.log_tramas += 1
+
     def procesar(self, texto):
         if not texto:
             return
         self.ultimo_dato = time.monotonic()
+        if self.crudo:
+            try:
+                self.crudo.write(texto + "\n")
+            except ValueError:                 # ya se cerro
+                pass
+        if texto.startswith("L:"):
+            self.contar_trama(texto)
+            return
         if texto.startswith("P: "):
             c = dict(PATRON_CAMPOS.findall(texto))
             try:
@@ -734,6 +776,13 @@ class Dashboard:
             self.txt.config(state="disabled")
         if self._f:
             self._f.flush()
+        if self.crudo:
+            self.crudo.flush()
+        if self.log_tramas:
+            self.lbl_registro.config(
+                text=f"REGISTRO: {os.path.basename(self.csv_ruta)} · entradas {self.log_tramas}"
+                     f" · perdidas {self.log_perdidas}",
+                fg=T.AMARILLO if self.log_perdidas else T.TEXTO_TENUE)
 
     # ================================================================ archivo
     def abrir_csv(self):
@@ -757,9 +806,12 @@ class Dashboard:
         try:
             self.escribir("#M0,0")
             self.escribir("#WS")
+            self.escribir("#L0")
         finally:
             if self._f:
                 self._f.close()
+            if self.crudo:
+                self.crudo.close()
             self.root.destroy()
 
     def ejecutar(self):
