@@ -29,17 +29,19 @@ from tkinter import ttk
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import control_carro as cc                     # noqa: E402  (puertos, Xbox, mezcla)
-from angulo_gui import Grafica                 # noqa: E402
+import tema_oscuro as T                        # noqa: E402  (colores y componentes)
 
 PERIODO_MS = 50                 # manejo y refresco de la ventana
 RASTRO_MAX = 3000
 PATRON_CAMPOS = re.compile(r"(\w+)=([^\s|]+)")
-COLOR_CARRO = "#1f77b4"
-COLOR_RASTRO = "#9ecae1"
-COLOR_RUTA = "#d62728"
-COLOR_HECHO = "#2ca02c"
-COLOR_REJILLA = "#ececec"
-COLOR_EJES = "#bbbbbb"
+COLOR_MAPA = "#081120"
+COLOR_CARRO = T.CIAN
+COLOR_RASTRO = "#5eead4"
+COLOR_RUTA = T.ROSA
+COLOR_HECHO = T.VERDE
+COLOR_REJILLA = "#0f1d33"
+COLOR_REJILLA_1M = "#16304f"
+COLOR_EJES = "#2b5a8a"
 
 # Mensajes del carro que si van a la caja de mensajes
 PREFIJOS_MENSAJE = ("RUTA", "ODO", "ANG:", "CONTROL", "ASISTENCIA", "EVASION", "YAW_TURN",
@@ -53,12 +55,13 @@ class Dashboard:
         self.lock = threading.Lock()           # escrituras al puerto
         self.datos_lock = threading.Lock()     # rastro y serie (los llena el hilo lector)
         self.vivo = True
+        self.nombre_conexion = nombre_conexion
         self.t0 = time.monotonic()
 
         # Estado recibido del carro
         self.pose = None                       # dict con x, y, th, v, ...
         self.rastro = collections.deque(maxlen=RASTRO_MAX)
-        self.serie = collections.deque(maxlen=2000)   # (t, th, v, us)
+        self.serie = collections.deque(maxlen=2000)   # (t, th, v, us, rpm promedio)
         self.gps = {"estado": "sin datos"}
         self.rumbo_linea = ""
         self.ang_linea = ""
@@ -103,99 +106,162 @@ class Dashboard:
     # ================================================================ interfaz
     def construir(self):
         r = self.root
-        estilo = ttk.Style(r)
-        estilo.configure("Parar.TButton", foreground="#b00000", font=("Segoe UI", 10, "bold"))
+        T.aplicar_estilo(r)
 
-        barra = ttk.Frame(r)
-        barra.pack(fill="x", padx=8, pady=6)
-        ttk.Button(barra, text="PARAR TODO", style="Parar.TButton",
-                   command=self.parar_todo).pack(side="left", padx=(0, 10))
-        ttk.Label(barra, text="Manejo:").pack(side="left")
+        # ---------------- Barra de titulo
+        titulo = tk.Frame(r, bg=T.FONDO)
+        titulo.pack(fill="x", padx=12, pady=(8, 2))
+        tk.Label(titulo, text="◢ TELEMETRÍA DEL CARRO", bg=T.FONDO, fg=T.CIAN,
+                 font=("Consolas", 16, "bold")).pack(side="left")
+        tk.Label(titulo, text=f"  //  {self.nombre_conexion}", bg=T.FONDO, fg=T.TEXTO_TENUE,
+                 font=("Consolas", 11)).pack(side="left")
+        self.lbl_reloj = tk.Label(titulo, text="", bg=T.FONDO, fg=T.TEXTO,
+                                  font=("Consolas", 14, "bold"))
+        self.lbl_reloj.pack(side="right")
+        self.lbl_conexion = tk.Label(titulo, text="● ESPERANDO DATOS", bg=T.FONDO,
+                                     fg=T.TEXTO_TENUE, font=("Consolas", 10, "bold"))
+        self.lbl_conexion.pack(side="right", padx=16)
+
+        # ---------------- Barra de manejo
+        barra = tk.Frame(r, bg=T.FONDO)
+        barra.pack(fill="x", padx=12, pady=(2, 6))
+        ttk.Button(barra, text="■ PARAR TODO", style="Peligro.TButton",
+                   command=self.parar_todo).pack(side="left", padx=(0, 12))
+        ttk.Label(barra, text="MANEJO", style="Fondo.TLabel",
+                  font=T.FUENTE_TITULO).pack(side="left", padx=(0, 4))
         for texto, valor in (("Apagado", "apagado"), ("Teclado (W/A/S/D)", "teclado"),
                              ("Control de Xbox", "xbox")):
             ttk.Radiobutton(barra, text=texto, value=valor, variable=self.manejo,
-                            command=self.cambio_manejo).pack(side="left", padx=2)
+                            command=self.cambio_manejo).pack(side="left", padx=3)
         self.btn_asist = ttk.Button(barra, text="Asistencia de rumbo: ON",
                                     command=self.alternar_asistencia)
-        self.btn_asist.pack(side="left", padx=10)
-        self.lbl_conexion = ttk.Label(barra, text="Esperando datos...", foreground="#666666")
-        self.lbl_conexion.pack(side="right")
+        self.btn_asist.pack(side="left", padx=12)
+        ttk.Label(barra, text="Esc = parar   ·   Q = parar   ·   H = asistencia",
+                  style="Fondo.TLabel").pack(side="right")
 
-        cuerpo = ttk.Frame(r)
-        cuerpo.pack(fill="both", expand=True, padx=8)
+        # ---------------- Indicadores grandes con mini grafica
+        kpis = tk.Frame(r, bg=T.FONDO)
+        kpis.pack(fill="x", padx=12)
+        self.kpi = {}
+        for clave, titulo_k, unidad, color in (
+                ("v", "Velocidad", "m/s", T.CIAN),
+                ("th", "Rumbo", "grados (izq +)", T.MORADO),
+                ("us", "Obstáculo", "cm al frente", T.NARANJA),
+                ("rpm", "RPM promedio", "der / izq", T.VERDE),
+                ("gps", "GPS", "satélites", T.AMARILLO)):
+            ind = T.Indicador(kpis, titulo_k, unidad, color)
+            ind.pack(side="left", fill="x", expand=True, padx=(0, 8))
+            self.kpi[clave] = ind
+
+        cuerpo = tk.Frame(r, bg=T.FONDO)
+        cuerpo.pack(fill="both", expand=True, padx=12, pady=8)
 
         # ---------------- Izquierda: mapa y ruta
-        izq = ttk.Frame(cuerpo)
+        izq = T.Panel(cuerpo, "Mapa  //  odometría y ruta")
         izq.pack(side="left", fill="both", expand=True)
-        botones = ttk.Frame(izq)
-        botones.pack(fill="x")
-        ttk.Button(botones, text="Ejecutar ruta", command=self.ejecutar_ruta).pack(side="left")
-        ttk.Button(botones, text="Detener ruta", command=lambda: self.escribir("#WS")).pack(side="left", padx=2)
-        ttk.Button(botones, text="Quitar ultimo", command=self.quitar_punto).pack(side="left", padx=2)
-        ttk.Button(botones, text="Borrar puntos", command=self.borrar_puntos).pack(side="left", padx=2)
-        ttk.Button(botones, text="Reiniciar origen", command=self.reiniciar_origen).pack(side="left", padx=2)
-        ttk.Checkbutton(botones, text="Seguir al carro", variable=self.seguir).pack(side="left", padx=6)
-        self.lbl_ruta = ttk.Label(botones, text="0 puntos")
+        botones = tk.Frame(izq, bg=T.PANEL)
+        botones.pack(fill="x", padx=8, pady=4)
+        ttk.Button(botones, text="▶ Ejecutar ruta", style="Accion.TButton",
+                   command=self.ejecutar_ruta).pack(side="left")
+        ttk.Button(botones, text="Detener ruta", command=lambda: self.escribir("#WS")).pack(side="left", padx=3)
+        ttk.Button(botones, text="Quitar último", command=self.quitar_punto).pack(side="left", padx=3)
+        ttk.Button(botones, text="Borrar puntos", command=self.borrar_puntos).pack(side="left", padx=3)
+        ttk.Button(botones, text="Reiniciar origen", command=self.reiniciar_origen).pack(side="left", padx=3)
+        ttk.Checkbutton(botones, text="Seguir al carro", variable=self.seguir,
+                        style="Panel.TCheckbutton").pack(side="left", padx=8)
+        self.lbl_ruta = tk.Label(botones, text="0 PUNTOS", bg=T.PANEL, fg=T.ROSA,
+                                 font=("Consolas", 10, "bold"))
         self.lbl_ruta.pack(side="right")
-        self.mapa = tk.Canvas(izq, bg="white", highlightthickness=1, highlightbackground="#cccccc")
-        self.mapa.pack(fill="both", expand=True, pady=4)
+        self.mapa = tk.Canvas(izq, bg=COLOR_MAPA, highlightthickness=0)
+        self.mapa.pack(fill="both", expand=True, padx=8, pady=(0, 4))
         self.mapa.bind("<Button-1>", self.clic_mapa)
         self.mapa.bind("<Button-3>", lambda e: self.quitar_punto())
         self.mapa.bind("<MouseWheel>", self.rueda_mapa)
-        ttk.Label(izq, text="Clic izquierdo: agregar punto · clic derecho: quitar el ultimo · "
-                            "rueda: zoom.  El carro arranca en (0, 0) mirando hacia arriba.",
-                  foreground="#666666").pack(anchor="w")
+        tk.Label(izq, text="Clic izquierdo: agregar punto · clic derecho: quitar el último · "
+                           "rueda: zoom.  El carro arranca en (0, 0) mirando hacia arriba.",
+                 bg=T.PANEL, fg=T.TEXTO_TENUE, font=T.FUENTE_UI).pack(anchor="w", padx=8, pady=(0, 6))
 
-        # ---------------- Derecha: datos, graficas, control de angulo, mensajes
-        der = ttk.Frame(cuerpo, width=520)
-        der.pack(side="right", fill="both", padx=(8, 0))
+        # ---------------- Derecha: sistemas, graficas, control de angulo, mensajes
+        der = tk.Frame(cuerpo, bg=T.FONDO, width=560)
+        der.pack(side="right", fill="both", padx=(10, 0))
         der.pack_propagate(False)
 
-        datos = ttk.LabelFrame(der, text="Datos del carro")
-        datos.pack(fill="x")
+        sist = T.Panel(der, "Sistemas")
+        sist.pack(fill="x")
+        fila = tk.Frame(sist, bg=T.PANEL)
+        fila.pack(fill="x", padx=6, pady=4)
+        self.anillos = {}
+        for clave, titulo_a, color in (("pd", "PWM der", T.CIAN), ("pi", "PWM izq", T.MORADO),
+                                       ("ruta", "Ruta", T.ROSA)):
+            a = T.Anillo(fila, titulo_a, color, tam=92)
+            a.pack(side="left", padx=2)
+            self.anillos[clave] = a
+        self.tablero = T.TableroEstados(fila, ["ENLACE", "ODOM", "GPS", "RUTA", "ÁNGULO",
+                                               "ASIST", "MANEJO", "OBST", "LOG"], columnas=3, alto=104)
+        self.tablero.pack(side="left", fill="both", expand=True, padx=(6, 0))
+
+        datos = tk.Frame(sist, bg=T.PANEL)
+        datos.pack(fill="x", padx=8, pady=(0, 6))
         self.valores = {}
-        campos = [("Modo", "modo"), ("Posicion (m)", "pos"), ("Rumbo", "th"),
-                  ("Velocidad", "v"), ("RPM der / izq", "rpm"), ("PWM der / izq", "pwm"),
-                  ("Obstaculo", "us"), ("Ruta", "wp"), ("Asistencia", "rumbo"),
-                  ("GPS", "gps"), ("GPS posicion", "gpspos")]
-        for i, (titulo, clave) in enumerate(campos):
-            ttk.Label(datos, text=titulo + ":").grid(row=i // 2, column=(i % 2) * 2, sticky="w", padx=4)
-            v = ttk.Label(datos, text="-", font=("Consolas", 10))
-            v.grid(row=i // 2, column=(i % 2) * 2 + 1, sticky="w", padx=(0, 12))
+        campos = [("MODO", "modo"), ("POSICIÓN", "pos"), ("PWM D/I", "pwm"), ("RUTA", "wp"),
+                  ("ASIST", "rumbo"), ("GPS", "gps"), ("GPS POS", "gpspos")]
+        for i, (titulo_c, clave) in enumerate(campos):
+            fila_c, col = (i // 2, (i % 2) * 2) if clave != "gpspos" else (3, 2)
+            tk.Label(datos, text=titulo_c, bg=T.PANEL, fg=T.TEXTO_TENUE,
+                     font=T.FUENTE_TITULO).grid(row=fila_c, column=col, sticky="w", padx=(0, 6))
+            v = tk.Label(datos, text="-", bg=T.PANEL, fg=T.TEXTO, font=T.FUENTE_MONO, anchor="w")
+            v.grid(row=fila_c, column=col + 1, sticky="w", padx=(0, 14))
             self.valores[clave] = v
+        self.valores["modo"].config(fg=T.CIAN, font=("Consolas", 10, "bold"))
 
-        self.g_th = Grafica(der, "Rumbo", "grados", 120)
-        self.g_v = Grafica(der, "Velocidad", "m/s", 110)
-        self.g_us = Grafica(der, "Obstaculo al frente", "cm", 110, y_fijo=(0, 200))
+        self.g_th = T.GraficaOscura(der, "Rumbo", "°", T.MORADO, alto=104)
+        self.g_th.pack(fill="x", pady=(8, 0))
+        self.g_v = T.GraficaOscura(der, "Velocidad", "m/s", T.CIAN, alto=92)
+        self.g_v.pack(fill="x", pady=(6, 0))
+        self.g_us = T.GraficaOscura(der, "Obstáculo al frente", "cm", T.NARANJA, alto=92, y_fijo=(0, 200))
+        self.g_us.pack(fill="x", pady=(6, 0))
 
-        ang = ttk.LabelFrame(der, text="Control de angulo (+ = derecha)")
-        ang.pack(fill="x", pady=4)
-        ttk.Label(ang, text="Referencia:").pack(side="left", padx=(4, 0))
-        self.ref = ttk.Entry(ang, width=6)
-        self.ref.pack(side="left", padx=2)
+        ang = T.Panel(der, "Control de ángulo  (+ = derecha)")
+        ang.pack(fill="x", pady=(8, 0))
+        f1 = tk.Frame(ang, bg=T.PANEL)
+        f1.pack(fill="x", padx=8, pady=(4, 2))
+        ttk.Label(f1, text="Referencia").pack(side="left")
+        self.ref = ttk.Entry(f1, width=6)
+        self.ref.pack(side="left", padx=4)
         self.ref.bind("<Return>", lambda e: self.enviar_angulo())
-        ttk.Button(ang, text="Ir", width=4, command=self.enviar_angulo).pack(side="left")
-        ttk.Radiobutton(ang, text="PID", value="PID", variable=self.modo_ang,
-                        command=lambda: self.escribir("#CP")).pack(side="left", padx=(6, 0))
-        ttk.Radiobutton(ang, text="ON/OFF", value="ONOFF", variable=self.modo_ang,
+        ttk.Button(f1, text="Ir", width=4, style="Accion.TButton",
+                   command=self.enviar_angulo).pack(side="left")
+        ttk.Radiobutton(f1, text="PID", value="PID", variable=self.modo_ang, style="Panel.TRadiobutton",
+                        command=lambda: self.escribir("#CP")).pack(side="left", padx=(10, 0))
+        ttk.Radiobutton(f1, text="ON/OFF", value="ONOFF", variable=self.modo_ang, style="Panel.TRadiobutton",
                         command=lambda: self.escribir("#CO")).pack(side="left")
-        ttk.Button(ang, text="Apagar", command=lambda: self.escribir("#CX")).pack(side="left", padx=4)
-        gan = ttk.Frame(der)
-        gan.pack(fill="x")
+        ttk.Button(f1, text="Apagar", command=lambda: self.escribir("#CX")).pack(side="left", padx=6)
+        f2 = tk.Frame(ang, bg=T.PANEL)
+        f2.pack(fill="x", padx=8, pady=(2, 6))
         self.k = {}
         for nombre, valor in (("Kp", "3"), ("Ki", "0.5"), ("Kd", "0.15")):
-            ttk.Label(gan, text=nombre + ":").pack(side="left", padx=(4, 0))
-            e = ttk.Entry(gan, width=5)
+            ttk.Label(f2, text=nombre).pack(side="left", padx=(0, 2))
+            e = ttk.Entry(f2, width=5)
             e.insert(0, valor)
-            e.pack(side="left", padx=2)
+            e.pack(side="left", padx=(0, 8))
             self.k[nombre] = e
-        ttk.Button(gan, text="Aplicar ganancias", command=self.enviar_ganancias).pack(side="left", padx=4)
+        ttk.Button(f2, text="Aplicar ganancias", command=self.enviar_ganancias).pack(side="left")
 
-        ttk.Label(der, text="Mensajes del carro:").pack(anchor="w", pady=(6, 0))
-        self.txt = tk.Text(der, height=7, font=("Consolas", 9), state="disabled")
-        self.txt.pack(fill="both", expand=True)
-        ttk.Label(der, text=f"Registro: {os.path.basename(self.csv_ruta)}",
-                  foreground="#666666").pack(anchor="w")
+        msj = T.Panel(der, "Mensajes del carro")
+        msj.pack(fill="both", expand=True, pady=(8, 0))
+        self.txt = tk.Text(msj, height=5, font=T.FUENTE_MONO_P, state="disabled", bg=T.PANEL_2,
+                           fg=T.TEXTO, insertbackground=T.CIAN, relief="flat",
+                           highlightthickness=0, padx=6, pady=4)
+        self.txt.pack(fill="both", expand=True, padx=8, pady=(4, 8))
+
+        # ---------------- Barra inferior
+        pie = tk.Frame(r, bg=T.PANEL, highlightthickness=1, highlightbackground=T.BORDE)
+        pie.pack(fill="x", side="bottom")
+        self.lbl_ticker = tk.Label(pie, text="▸ Listo", bg=T.PANEL, fg=T.CIAN,
+                                   font=T.FUENTE_MONO_P, anchor="w")
+        self.lbl_ticker.pack(side="left", fill="x", expand=True, padx=10, pady=3)
+        tk.Label(pie, text=f"REGISTRO: {os.path.basename(self.csv_ruta)}", bg=T.PANEL,
+                 fg=T.TEXTO_TENUE, font=T.FUENTE_MONO_P).pack(side="right", padx=10)
 
     # ================================================================ envio
     def escribir(self, linea):
@@ -375,7 +441,7 @@ class Dashboard:
                 if not self.rastro or math.hypot(p["x"] - self.rastro[-1][0],
                                                  p["y"] - self.rastro[-1][1]) > 0.005:
                     self.rastro.append((p["x"], p["y"]))
-                self.serie.append((t, p["th"], p["v"], p["us"]))
+                self.serie.append((t, p["th"], p["v"], p["us"], (p["rd"] + p["ri"]) / 2))
             if self.csv:
                 self.csv.writerow([f"{t:.2f}", p["x"], p["y"], p["th"], p["v"], p["rd"], p["ri"],
                                    p["pd"], p["pi"], p["us"], p["md"], p["wp"]])
@@ -435,24 +501,33 @@ class Dashboard:
         i = math.floor(min(x0, x1) / paso)
         while i * paso <= max(x0, x1):
             _, sy = self.a_pantalla(i * paso, 0)
-            c.create_line(0, sy, w, sy, fill=COLOR_EJES if i == 0 else COLOR_REJILLA)
-            if abs((i * paso) % 1.0) < 1e-6:
-                c.create_text(4, sy - 7, text=f"x={i * paso:g} m", anchor="w", fill="#999999",
-                              font=("Segoe UI", 8))
+            entero = abs((i * paso) % 1.0) < 1e-6
+            c.create_line(0, sy, w, sy, fill=COLOR_EJES if i == 0 else
+                          (COLOR_REJILLA_1M if entero else COLOR_REJILLA))
+            if entero:
+                c.create_text(6, sy - 8, text=f"x={i * paso:g} m", anchor="w", fill=T.TEXTO_TENUE,
+                              font=("Consolas", 8))
             i += 1
         j = math.floor(min(y_izq, y_der) / paso)
         while j * paso <= max(y_izq, y_der):
             sx, _ = self.a_pantalla(0, j * paso)
-            c.create_line(sx, 0, sx, h, fill=COLOR_EJES if j == 0 else COLOR_REJILLA)
+            entero = abs((j * paso) % 1.0) < 1e-6
+            c.create_line(sx, 0, sx, h, fill=COLOR_EJES if j == 0 else
+                          (COLOR_REJILLA_1M if entero else COLOR_REJILLA))
             j += 1
 
-        # Rastro
+        # Origen
+        ox, oy = self.a_pantalla(0, 0)
+        c.create_oval(ox - 4, oy - 4, ox + 4, oy + 4, outline=T.TEXTO_TENUE)
+
+        # Rastro (con un halo para que brille)
         with self.datos_lock:
             rastro = list(self.rastro)
         if len(rastro) >= 2:
             pts = []
             for (x, y) in rastro:
                 pts.extend(self.a_pantalla(x, y))
+            c.create_line(*pts, fill=T.mezclar(T.CIAN, COLOR_MAPA, 0.25), width=6)
             c.create_line(*pts, fill=COLOR_RASTRO, width=2)
 
         # Ruta: desde el carro (o el origen) por todos los puntos
@@ -476,14 +551,20 @@ class Dashboard:
                 sx, sy = self.a_pantalla(x, y)
                 hecho = en_ruta and n < idx_actual
                 color = COLOR_HECHO if hecho else COLOR_RUTA
-                r = 9 if (en_ruta and n == idx_actual) else 7
+                r = 10 if (en_ruta and n == idx_actual) else 8
+                if en_ruta and n == idx_actual:
+                    c.create_oval(sx - r - 5, sy - r - 5, sx + r + 5, sy + r + 5,
+                                  outline=T.mezclar(color, COLOR_MAPA, 0.4), width=2)
                 c.create_oval(sx - r, sy - r, sx + r, sy + r, outline=color, width=2,
-                              fill="#ffffff" if not hecho else "#dff0d8")
-                c.create_text(sx, sy, text=str(n + 1), font=("Segoe UI", 8, "bold"), fill=color)
+                              fill=T.mezclar(color, COLOR_MAPA, 0.25))
+                c.create_text(sx, sy, text=str(n + 1), font=("Consolas", 8, "bold"), fill=T.TEXTO)
 
         # Carro: triangulo en su posicion y rumbo (th: + = izquierda)
         if self.pose:
             x, y, th = self.pose["x"], self.pose["y"], math.radians(self.pose["th"])
+            sx, sy = self.a_pantalla(x, y)
+            c.create_oval(sx - 18, sy - 18, sx + 18, sy + 18, fill=T.mezclar(T.CIAN, COLOR_MAPA, 0.12),
+                          outline=T.mezclar(T.CIAN, COLOR_MAPA, 0.35))
             largo = 0.18
             ancho = 0.10
             frente = (x + largo * 0.6 * math.cos(th), y + largo * 0.6 * math.sin(th))
@@ -493,53 +574,96 @@ class Dashboard:
             pts = []
             for p in (frente, izq, der):
                 pts.extend(self.a_pantalla(*p))
-            c.create_polygon(*pts, fill=COLOR_CARRO, outline="#0b3d66")
-        c.create_text(w - 6, h - 8, text=f"{self.escala:.0f} px/m", anchor="e", fill="#999999",
-                      font=("Segoe UI", 8))
+            c.create_polygon(*pts, fill=COLOR_CARRO, outline="#ffffff", width=1)
+            c.create_text(sx + 22, sy - 14, anchor="w", fill=T.CIAN, font=("Consolas", 8),
+                          text=f"({x:+.2f}, {y:+.2f}) {self.pose['th']:+.0f}°")
+        c.create_text(w - 8, h - 10, text=f"{self.escala:.0f} px/m", anchor="e", fill=T.TEXTO_TENUE,
+                      font=("Consolas", 8))
 
     def refrescar(self):
         p = self.pose
+        with self.datos_lock:
+            s = list(self.serie)
+        recientes = s[-80:]
         if p:
             v = self.valores
             v["modo"].config(text=p["md"])
-            v["pos"].config(text=f"x {p['x']:+.2f}  y {p['y']:+.2f}")
-            v["th"].config(text=f"{p['th']:+.1f}° (izq +)")
-            v["v"].config(text=f"{p['v']:+.2f} m/s")
-            v["rpm"].config(text=f"{p['rd']:.0f} / {p['ri']:.0f}")
-            v["pwm"].config(text=f"{p['pd']:.0f} / {p['pi']:.0f}")
-            v["us"].config(text="sin eco" if p["us"] < 0 else f"{p['us']:.0f} cm")
+            v["pos"].config(text=f"x {p['x']:+.2f}  y {p['y']:+.2f} m")
+            v["pwm"].config(text=f"{p['pd']:.0f} / {p['pi']:.0f} %")
             v["wp"].config(text=f"punto {p['wp']}")
-        self.valores["rumbo"].config(text=(self.rumbo_linea[:34] or
+            self.kpi["v"].actualizar(f"{p['v']:+.2f}", [q[2] for q in recientes])
+            self.kpi["th"].actualizar(f"{p['th']:+.1f}°", [q[1] for q in recientes])
+            self.kpi["us"].actualizar("sin eco" if p["us"] < 0 else f"{p['us']:.0f}",
+                                      [q[3] for q in recientes if q[3] >= 0])
+            self.kpi["rpm"].actualizar(f"{(p['rd'] + p['ri']) / 2:.0f}", [q[4] for q in recientes])
+            self.kpi["rpm"].unidad = f"der {p['rd']:.0f} / izq {p['ri']:.0f}"
+            self.anillos["pd"].actualizar(abs(p["pd"]) / 100.0, f"{p['pd']:.0f}%")
+            self.anillos["pi"].actualizar(abs(p["pi"]) / 100.0, f"{p['pi']:.0f}%")
+            try:
+                hechos, total = (int(n) for n in p["wp"].split("/"))
+            except ValueError:
+                hechos, total = 0, 0
+        else:
+            for clave in ("v", "th", "us", "rpm"):
+                self.kpi[clave].actualizar("-", [])
+            self.anillos["pd"].actualizar(0, "-")
+            self.anillos["pi"].actualizar(0, "-")
+            hechos, total = 0, 0
+        total = total or len(self.puntos)
+        self.anillos["ruta"].actualizar(hechos / total if total else 0, f"{hechos}/{total}")
+        self.valores["rumbo"].config(text=(self.rumbo_linea[:30] or
                                            ("ON" if self.asistencia else "OFF")))
         g = self.gps
-        if g.get("FIX") == "1":
-            self.valores["gps"].config(text=f"FIX  {g.get('SAT', '?')} sat  HDOP {g.get('HDOP', '?')}")
+        fix = g.get("FIX") == "1"
+        if fix:
+            self.valores["gps"].config(text=f"FIX {g.get('SAT', '?')} sat HDOP {g.get('HDOP', '?')}")
             self.valores["gpspos"].config(text=f"{g.get('LAT', '?')}, {g.get('LON', '?')}")
         else:
             self.valores["gps"].config(text=f"{g.get('estado', '-')} {g.get('SAT', '')}")
             self.valores["gpspos"].config(text="-")
-        self.lbl_ruta.config(text=f"{len(self.puntos)} puntos")
+        sat = g.get("SAT", "-")
+        self.kpi["gps"].unidad = f"HDOP {g.get('HDOP', '-')}" if fix else "sin posición"
+        self.kpi["gps"].actualizar(sat, [])
+        self.lbl_ruta.config(text=f"{len(self.puntos)} PUNTOS")
+        self.lbl_reloj.config(text=time.strftime("%H:%M:%S"))
 
         edad = time.monotonic() - self.ultimo_dato if self.ultimo_dato else None
         if edad is None:
-            self.lbl_conexion.config(text="Esperando datos del carro...", foreground="#666666")
+            self.lbl_conexion.config(text="● ESPERANDO DATOS", fg=T.TEXTO_TENUE)
+            enlace = "off"
         elif edad > 2.0:
-            self.lbl_conexion.config(text=f"Sin datos hace {edad:.0f} s", foreground="#b00000")
+            self.lbl_conexion.config(text=f"● SIN DATOS HACE {edad:.0f} s", fg=T.ROJO)
+            enlace = "mal"
         else:
-            self.lbl_conexion.config(text="Conectado, recibiendo datos", foreground="#2c7a2c")
+            self.lbl_conexion.config(text="● EN LÍNEA", fg=T.VERDE)
+            enlace = "ok"
+
+        md = p["md"] if p else ""
+        us = p["us"] if p else -1
+        self.tablero.actualizar({
+            "ENLACE": enlace,
+            "ODOM": "ok" if p else "off",
+            "GPS": "ok" if fix else ("aviso" if g.get("estado") not in (None, "sin datos") else "off"),
+            "RUTA": "activo" if md == "RUTA" else ("aviso" if self.puntos else "off"),
+            "ÁNGULO": "activo" if md == "ANGULO" else "off",
+            "ASIST": "activo" if self.asistencia else "off",
+            "MANEJO": "activo" if self.manejo.get() != "apagado" else "off",
+            "OBST": "off" if us < 0 or not p else ("mal" if us <= 20 else ("aviso" if us <= 50 else "ok")),
+            "LOG": "ok" if self.csv else "mal",
+        })
 
         t_fin = time.monotonic() - self.t0
-        with self.datos_lock:
-            s = list(self.serie)
-        self.g_th.dibujar(t_fin, [([(q[0], q[1]) for q in s], COLOR_CARRO, "rumbo", False)])
-        self.g_v.dibujar(t_fin, [([(q[0], q[2]) for q in s], "#ff7f0e", "velocidad", False)])
-        self.g_us.dibujar(t_fin, [([(q[0], q[3]) for q in s if q[3] >= 0], "#9467bd", "distancia", False)])
+        self.g_th.dibujar(t_fin, [(q[0], q[1]) for q in s])
+        self.g_v.dibujar(t_fin, [(q[0], q[2]) for q in s])
+        self.g_us.dibujar(t_fin, [(q[0], q[3]) for q in s if q[3] >= 0])
         self.dibujar_mapa()
 
         if self.mensajes:
             self.txt.config(state="normal")
             while self.mensajes:
-                self.txt.insert("end", self.mensajes.popleft() + "\n")
+                m = self.mensajes.popleft()
+                self.txt.insert("end", m + "\n")
+                self.lbl_ticker.config(text="▸ " + m, fg=T.ROJO if m.startswith("ERROR") else T.CIAN)
             self.txt.see("end")
             self.txt.config(state="disabled")
         if self._f:
