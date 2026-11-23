@@ -188,7 +188,8 @@ class MapaGPS(tk.Frame):
         ttk.Button(b2, text="Calibrar imagen", command=self.calibrar).pack(side="left", padx=3)
         ttk.Button(b2, text="Descargar zona", command=self.descargar).pack(side="left", padx=3)
         ttk.Button(b2, text="Centrar en GPS", command=self.centrar_gps).pack(side="left", padx=3)
-        ttk.Checkbutton(b2, text="Seguir GPS", variable=self.seguir,
+        ttk.Button(b2, text="Ajustar a la ruta", command=self.ajustar_vista).pack(side="left", padx=3)
+        ttk.Checkbutton(b2, text="Seguir carro", variable=self.seguir,
                         style="Panel.TCheckbutton").pack(side="left", padx=6)
 
         self.lienzo = tk.Canvas(self, bg="#081120", highlightthickness=0)
@@ -467,6 +468,43 @@ class MapaGPS(tk.Frame):
         self.ruta.clear()
         self.guardar_ruta()
 
+    def pos_carro(self):
+        """Posicion del carro: la estimada por la odometria (marco de la X) si se puede,
+        si no la del GPS."""
+        pose = self.d.pose
+        if pose and self.x0 and self.psi0 is not None and self.d.ruta_origen == "gps":
+            e, n = odo_a_enu(pose["x"], pose["y"], self.psi0)
+            return de_enu(e, n, *self.x0)
+        return self.d.gps_posicion()
+
+    def ajustar_vista(self):
+        """Zoom y centro para que se vean la X, la ruta y el carro."""
+        pts = ([self.x0] if self.x0 else []) + list(self.ruta)
+        carro = self.pos_carro()
+        if carro:
+            pts.append(carro)
+        if not pts:
+            self.d.mensajes.append("MAPA: no hay ruta ni posicion para ajustar la vista")
+            return
+        gs = [a_global(*p) for p in pts]
+        xs, ys = [g[0] for g in gs], [g[1] for g in gs]
+        self.centro = ((min(xs) + max(xs)) / 2, (min(ys) + max(ys)) / 2)
+        w, h = self.tam()
+        ancho = max(max(xs) - min(xs), 1e-9)
+        alto = max(max(ys) - min(ys), 1e-9)
+        if self.modo_fondo.get() == "img" and self.img_cal:
+            for nivel in range(3, -4, -1):
+                self.img_nivel = nivel
+                k = self.escala()
+                if ancho * k <= w - 100 and alto * k <= h - 100:
+                    break
+        else:
+            for z in range(22, 13, -1):
+                k = 2.0 ** z
+                if ancho * k <= w - 100 and alto * k <= h - 100:
+                    break
+            self.z = float(z)
+
     def centrar_gps(self):
         pos = self.d.gps_posicion()
         if pos:
@@ -527,6 +565,8 @@ class MapaGPS(tk.Frame):
             espera = 5.0
         pts = self.puntos_odometria()
         self.d.ejecutar_ruta_odometria(pts, int(max(0.0, min(30.0, espera)) * 1000), reiniciar=True)
+        self.ajustar_vista()                   # que se vea toda la ruta...
+        self.seguir.set(True)                  # ...y seguir al carro mientras la recorre
         self.d.mensajes.append("MAPA: ruta enviada: " + "  ".join(f"({x:+.2f},{y:+.2f})" for x, y in pts))
 
     # ================================================================ archivo
@@ -554,8 +594,9 @@ class MapaGPS(tk.Frame):
         c.delete("all")
         w, h = self.tam()
         gps = self.d.gps_posicion()
-        if self.seguir.get() and gps:
-            self.centro = a_global(*gps)
+        carro = self.pos_carro() if self.seguir.get() else None
+        if carro:
+            self.centro = a_global(*carro)
         if self.modo_fondo.get() == "img":
             self.dibujar_img(c, w, h)
         else:
@@ -586,7 +627,7 @@ class MapaGPS(tk.Frame):
             for n, p in enumerate(self.ruta):
                 sx, sy = self.a_pant(*p)
                 k = self.d.idx_parada[n] if n < len(self.d.idx_parada) else n
-                color = T.VERDE if (hechos and k < hechos) else T.ROSA
+                color = T.VERDE if (hechos and k < hechos and self.d.ruta_origen == "gps") else T.ROSA
                 c.create_oval(sx - 9, sy - 9, sx + 9, sy + 9, outline=color, width=2,
                               fill=T.mezclar(color, "#081120", 0.35))
                 c.create_text(sx, sy, text=str(n + 1), fill="#ffffff", font=("Consolas", 8, "bold"))

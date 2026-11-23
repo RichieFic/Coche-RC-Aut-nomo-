@@ -110,6 +110,7 @@ class Dashboard:
         self.vel_ruta = tk.StringVar(master=self.root, value="80")   # % en recta
         self.curvas = tk.BooleanVar(master=self.root, value=True)    # esquinas en curva
         self.ruta_enviada = []                 # [(x, y, paso)] lo que se mando al carro
+        self.ruta_origen = None                # "odo" o "gps": que pestana mando la ruta
         self.idx_parada = []                   # indice en ruta_enviada de cada punto del usuario
         self.escala = 120.0                    # pixeles por metro
         self.centro = [0.0, 0.0]               # punto del mundo al centro del mapa
@@ -119,9 +120,7 @@ class Dashboard:
         self.root.bind("<KeyRelease>", self.tecla_sube)
 
         threading.Thread(target=self.lector, daemon=True).start()
-        self.escribir("#H1")
-        self.escribir("#L1")                   # registro de entradas a 50 Hz
-        self.enviar_configuracion()
+        self.enviar_configuracion()            # #H1, #L1 y la calibracion del magnetometro
         self.root.after(PERIODO_MS, self.ciclo)
         if cerrar_en_ms:
             self.root.after(cerrar_en_ms, self.cerrar)
@@ -423,7 +422,7 @@ class Dashboard:
             with self.datos_lock:
                 self.rastro.clear()
             self.centro = [0.0, 0.0]
-        self.enviar_ruta(self.puntos, espera_ms, reiniciar)
+        self.enviar_ruta(self.puntos, espera_ms, reiniciar, origen="gps")
 
     def ruta_a_enviar(self, puntos, inicio=None):
         """Paradas del usuario -> lista para el carro (con arcos si esta activado)."""
@@ -431,9 +430,10 @@ class Dashboard:
             inicio = (self.pose["x"], self.pose["y"]) if self.pose else (0.0, 0.0)
         return curvas.ruta_con_curvas(inicio, puntos, curvas=self.curvas.get())
 
-    def enviar_ruta(self, puntos, espera_ms=None, reiniciar=False):
+    def enviar_ruta(self, puntos, espera_ms=None, reiniciar=False, origen="odo"):
         enviados, idx = self.ruta_a_enviar(puntos, (0.0, 0.0) if reiniciar else None)
         self.ruta_enviada, self.idx_parada = enviados, idx
+        self.ruta_origen = origen
         if len(puntos) and self.curvas.get():
             pasos = sum(1 for p in enviados if p[2])
             self.mensajes.append(f"RUTA: {len(puntos)} paradas + {pasos} puntos de curva")
