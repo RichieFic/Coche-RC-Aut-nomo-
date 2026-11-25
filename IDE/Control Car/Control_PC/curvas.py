@@ -6,14 +6,16 @@ deslice sin que lo midan los encoders ni el giroscopio. Para evitarlo, cada
 esquina se cambia por un arco (curva de Bezier tangente a los dos tramos):
 
     ... A ---- T1 .                     T1, T2: entrada y salida del arco
-                   '.  <- M (parada)    M: mitad del arco = el waypoint, donde
-                     '.                    el carro frena y espera
-                      T2
-                      |
+                   '.
+                     '.
+                      T2  <- parada     T2 = el waypoint: el carro frena y espera
+                      |                 ya alineado con el siguiente tramo
                       B ...
 
-Los puntos del arco van como "de paso" (#W x,y,1: no frena ni espera) y la
-mitad del arco como parada normal. El ultimo punto (la meta) no se redondea.
+Los puntos del arco van como "de paso" (#W x,y,1: no frena ni espera) y el
+FINAL del arco como parada normal, para que el carro recorra toda la curva
+avanzando y salga recto (con la parada a la mitad llegaba con solo ~12 grados
+de giro y al salir pivotaba ~57). El ultimo punto (la meta) no se redondea.
 """
 
 import math
@@ -63,11 +65,11 @@ def ruta_con_curvas(inicio, puntos, radio=RADIO_M, curvas=True):
                 idx.append(len(enviados))
                 enviados.append((c[0], c[1], 0))
                 continue
-            medio = n // 2
+            fin = n - 1
             for k, p in enumerate(arco):
-                if k == medio:
+                if k == fin:
                     idx.append(len(enviados))
-                enviados.append((p[0], p[1], 0 if k == medio else 1))
+                enviados.append((p[0], p[1], 0 if k == fin else 1))
         if len(enviados) <= MAX_PUNTOS or not curvas:
             return enviados[:MAX_PUNTOS], idx
     return ruta_con_curvas(inicio, puntos, radio, curvas=False)

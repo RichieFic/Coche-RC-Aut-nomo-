@@ -91,6 +91,7 @@ class Dashboard:
         except (OSError, ValueError):
             pass
         self.cal_mag = None                     # muestras durante la calibracion
+        self.aviso_gyro = False
         self.log_seq = None
         self.log_tramas = 0
         self.log_perdidas = 0
@@ -228,7 +229,7 @@ class Dashboard:
             a = T.Anillo(fila, titulo_a, color, tam=92)
             a.pack(side="left", padx=2)
             self.anillos[clave] = a
-        self.tablero = T.TableroEstados(fila, ["ENLACE", "ODOM", "GPS", "RUTA", "ÁNGULO",
+        self.tablero = T.TableroEstados(fila, ["ENLACE", "GYRO", "GPS", "RUTA", "ÁNGULO",
                                                "ASIST", "MANEJO", "OBST", "LOG"], columnas=3, alto=104)
         self.tablero.pack(side="left", fill="both", expand=True, padx=(6, 0))
 
@@ -268,6 +269,7 @@ class Dashboard:
         ttk.Radiobutton(f1, text="ON/OFF", value="ONOFF", variable=self.modo_ang, style="Panel.TRadiobutton",
                         command=lambda: self.escribir("#CO")).pack(side="left")
         ttk.Button(f1, text="Apagar", command=lambda: self.escribir("#CX")).pack(side="left", padx=6)
+        ttk.Button(f1, text="Recalibrar giroscopio", command=self.recalibrar_giroscopio).pack(side="left")
         f2 = tk.Frame(ang, bg=T.PANEL)
         f2.pack(fill="x", padx=8, pady=(2, 6))
         self.k = {}
@@ -358,6 +360,22 @@ class Dashboard:
         if cal:
             for c in calibrar_mag.comando(*cal):
                 self.escribir(c)
+
+    def recalibrar_giroscopio(self):
+        """#G: el carro vuelve a medir el sesgo del giroscopio (debe estar QUIETO)."""
+        self.manejo.set("apagado")
+        self.escribir("#M0,0")
+        self.escribir("#G")
+        self.mensajes.append("GYRO: recalibrando... no muevas el carro unos segundos")
+
+    def avisar_giroscopio(self):
+        """Aviso una vez si el carro reporta el giroscopio sin calibrar."""
+        p = self.pose
+        mal = bool(p and p.get("gy") is False)
+        if mal and not self.aviso_gyro:
+            self.mensajes.append("ERROR GYRO: sin calibrar (se movio al encender). Deja el carro quieto "
+                                 "y presiona 'Recalibrar giroscopio'; la ruta no arranca sin el.")
+        self.aviso_gyro = mal
 
     def calibrar_magnetometro(self):
         """Una vuelta completa con el control de angulo, ajuste de la elipse y #Q."""
@@ -590,7 +608,8 @@ class Dashboard:
                 p = {"x": int(c["x"]) / 1000.0, "y": int(c["y"]) / 1000.0, "th": int(c["th"]) / 10.0,
                      "v": int(c["v"]) / 1000.0, "rd": int(c["rd"]) / 10.0, "ri": int(c["ri"]) / 10.0,
                      "pd": int(c["pd"]) / 10.0, "pi": int(c["pi"]) / 10.0, "us": int(c["us"]) / 10.0,
-                     "md": c.get("md", "?"), "wp": c.get("wp", "0/0")}
+                     "md": c.get("md", "?"), "wp": c.get("wp", "0/0"),
+                     "gy": (c["gy"] == "1") if "gy" in c else None}
             except (KeyError, ValueError):
                 return
             t = time.monotonic() - self.t0
@@ -820,7 +839,7 @@ class Dashboard:
         us = p["us"] if p else -1
         self.tablero.actualizar({
             "ENLACE": enlace,
-            "ODOM": "ok" if p else "off",
+            "GYRO": "off" if not p or p.get("gy") is None else ("ok" if p["gy"] else "mal"),
             "GPS": "ok" if fix else ("aviso" if g.get("estado") not in (None, "sin datos") else "off"),
             "RUTA": "activo" if md == "RUTA" else ("aviso" if self.puntos else "off"),
             "ÁNGULO": "activo" if md == "ANGULO" else "off",
@@ -830,6 +849,7 @@ class Dashboard:
             "LOG": "ok" if self.csv else "mal",
         })
 
+        self.avisar_giroscopio()
         t_fin = time.monotonic() - self.t0
         self.g_th.dibujar(t_fin, [(q[0], q[1]) for q in s])
         self.g_v.dibujar(t_fin, [(q[0], q[2]) for q in s])

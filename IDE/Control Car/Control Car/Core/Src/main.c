@@ -363,6 +363,7 @@ float enc_rate_ref_deg = 0.0f;
 uint32_t enc_rate_ref_ms = 0U;
 uint8_t gyro_ok = 0U;
 float gyro_bias_dps = 0.0f;
+volatile uint8_t gyro_rx_recalibrar = 0U;   /* #G: volver a medir el sesgo (carro quieto) */
 float yaw_gyro_deg = 0.0f;             /* acumulado: izquierda +, derecha - */
 float gyro_rate_dps = 0.0f;            /* velocidad Z con signo de montaje */
 uint32_t gyro_last_ok_ms = 0U;
@@ -1432,7 +1433,7 @@ static void OdometriaPaso(void)
         odo_telemetria_ms = ahora;
         snprintf(linea, sizeof(linea),
                  "P: x=%ld y=%ld th=%ld v=%ld rd=%ld ri=%ld pd=%ld pi=%ld us=%ld md=%s wp=%u/%u"
-                 " mg=%ld mv=%u mx=%ld my=%ld mz=%ld\r\n",
+                 " mg=%ld mv=%u mx=%ld my=%ld mz=%ld gy=%u\r\n",
                  (long)(odo_x_m * 1000.0f), (long)(odo_y_m * 1000.0f),
                  (long)(odo_theta_deg * 10.0f), (long)(odo_v_ms * 1000.0f),
                  (long)(rpm_motor_derecho * 10.0f), (long)(rpm_motor_izquierdo * 10.0f),
@@ -1440,7 +1441,8 @@ static void OdometriaPaso(void)
                  (long)(us_ultima_cm * 10.0f), ModoTexto(),
                  (unsigned int)ruta_idx, (unsigned int)ruta_n,
                  (long)(imu_mag_norte_deg * 10.0f), (unsigned int)imu_mag_norte_ok,
-                 (long)(mv3[0] * 10.0f), (long)(mv3[1] * 10.0f), (long)(mv3[2] * 10.0f));
+                 (long)(mv3[0] * 10.0f), (long)(mv3[1] * 10.0f), (long)(mv3[2] * 10.0f),
+                 (unsigned int)(((gyro_ok != 0U) && (giro_fuente == GIRO_FUENTE_GYRO)) ? 1U : 0U));
         EnviarMensajeDebug(linea);
     }
 }
@@ -1817,6 +1819,10 @@ static void ProcesarLineaAngulo(const volatile char *s, uint8_t len)
         if (pos != len) return;
         for (i = 0U; i < 3U; i++) ang_rx_k[i] = v[i];
         ang_rx_k_nuevo = 1U;
+    }
+    else if ((s[0] == 'G') && (len == 1U))
+    {
+        gyro_rx_recalibrar = 1U;
     }
     else if ((s[0] == 'Z') && (len == 1U))
     {
@@ -3424,9 +3430,11 @@ int main(void)
             {
                 EnviarMensajeDebug("RUTA: no hay puntos\r\n");
             }
-            else if (FuenteGiroOk() == 0U)
+            else if ((gyro_ok == 0U) || (giro_fuente != GIRO_FUENTE_GYRO))
             {
-                EnviarMensajeDebug("RUTA: no disponible (sin giroscopio)\r\n");
+                /* Con el rumbo por encoders la ruta sale mal (las ruedas derrapan). */
+                EnviarMensajeDebug("RUTA: no disponible, giroscopio sin calibrar; "
+                                   "deja el carro quieto y manda #G\r\n");
             }
             else
             {
@@ -3449,6 +3457,48 @@ int main(void)
                 ruta_activa = 1U;
                 snprintf(m_r, sizeof(m_r), "RUTA: iniciada con %u puntos\r\n", (unsigned int)ruta_n);
                 EnviarMensajeDebug(m_r);
+            }
+        }
+        if (gyro_rx_recalibrar != 0U)
+        {
+            /* Volver a medir la vertical y el sesgo del giroscopio sin reiniciar.
+             * Bloquea ~2-5 s con los motores parados. */
+            float up_g[3];
+            float norma_g = 0.0f;
+            uint8_t intento;
+            uint8_t ok = 0U;
+            float odo_th_antes = odo_theta_deg;
+            gyro_rx_recalibrar = 0U;
+            DetenerTodo();
+            EnviarMensajeDebug("GYRO: recalibrando, deja el carro QUIETO\r\n");
+            if (MPU9250_DetectVertical(&hi2c1, GYRO_USAR_Z, up_g, &norma_g) == HAL_OK)
+            {
+                for (intento = 0U; (intento < 3U) && (ok == 0U); intento++)
+                {
+                    float bias = 0.0f;
+                    if (MPU9250_GyroCalibrateBias(&hi2c1, GYRO_BIAS_MS, &bias) == HAL_OK)
+                    {
+                        gyro_bias_dps = bias;
+                        ok = 1U;
+                    }
+                }
+            }
+            if (ok != 0U)
+            {
+                char g_msg[60];
+                int bias_x100 = (int)(gyro_bias_dps * 100.0f);
+                gyro_ok = 1U;
+                gyro_last_ok_ms = HAL_GetTick();
+                giro_fuente = (GIRO_FUENTE_PREFERIDA == GIRO_FUENTE_GYRO) ? GIRO_FUENTE_GYRO : GIRO_FUENTE_ENC;
+                /* que el rumbo de la odometria no salte al cambiar de fuente */
+                odo_theta0_deg = YawFuenteDeg() - odo_th_antes;
+                snprintf(g_msg, sizeof(g_msg), "GYRO_OK: sesgo=%s%d.%02d dps (recalibrado)\r\n",
+                         (bias_x100 < 0) ? "-" : "", abs(bias_x100) / 100, abs(bias_x100) % 100);
+                EnviarMensajeDebug(g_msg);
+            }
+            else
+            {
+                EnviarMensajeDebug("GYRO_ERROR: no se pudo recalibrar; el carro se movio o la IMU no responde\r\n");
             }
         }
         if ((mag_rx_qo != 0U) && (mag_rx_qe != 0U))
