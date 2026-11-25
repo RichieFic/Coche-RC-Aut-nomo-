@@ -85,6 +85,12 @@ def odo_a_enu(x, y, psi0):
     return x * math.sin(p) - y * math.cos(p), x * math.cos(p) + y * math.sin(p)
 
 
+def es_zoom(ev):
+    """Rueda del mouse (pasos de 120) o Ctrl / pellizco = zoom; dos dedos en el
+    trackpad (pasos chicos) = mover el mapa."""
+    return bool(ev.state & 0x0004) or (ev.delta != 0 and ev.delta % 120 == 0)
+
+
 def leer_lat_lon(texto):
     partes = texto.replace(";", ",").replace("°", "").split(",")
     if len(partes) != 2:
@@ -200,6 +206,9 @@ class MapaGPS(tk.Frame):
         self.lienzo.bind("<ButtonRelease-1>", self.soltar)
         self.lienzo.bind("<Button-3>", lambda e: self.quitar_punto())
         self.lienzo.bind("<MouseWheel>", self.rueda)
+        self.lienzo.bind("<Shift-MouseWheel>", self.rueda_h)
+        self.lienzo.bind("<ButtonPress-2>", self.presion_medio)
+        self.lienzo.bind("<B2-Motion>", self.mover_medio)
         self.estado = tk.Label(self, text="", bg=T.PANEL, fg=T.TEXTO_TENUE, font=T.FUENTE_UI, anchor="w")
         self.estado.pack(fill="x", padx=8, pady=(2, 6))
         if self.x0:
@@ -496,8 +505,39 @@ class MapaGPS(tk.Frame):
             self.ruta.append((lat, lon))
         self.guardar_ruta()
 
+    def desplazar(self, dx, dy):
+        """Mueve el contenido del mapa dx, dy pixeles de pantalla."""
+        self.seguir.set(False)
+        if self.img_sin_calibrar():
+            self.img_vista = [self.img_vista[0] + dx, self.img_vista[1] + dy]
+            return
+        k = self.escala()
+        self.centro = (self.centro[0] - dx / k, self.centro[1] - dy / k)
+
+    def presion_medio(self, ev):
+        self.arrastre_medio = (ev.x, ev.y)
+
+    def mover_medio(self, ev):
+        """Arrastrar con la rueda presionada: mover el mapa."""
+        if getattr(self, "arrastre_medio", None):
+            x0, y0 = self.arrastre_medio
+            self.desplazar(ev.x - x0, ev.y - y0)
+            self.arrastre_medio = (ev.x, ev.y)
+
+    def rueda_h(self, ev):
+        """Desplazamiento horizontal (dos dedos de lado en el trackpad / Shift + rueda)."""
+        self.desplazar(ev.delta, 0)
+
     def rueda(self, ev):
-        arriba = ev.delta > 0
+        if not es_zoom(ev):
+            self.desplazar(0, ev.delta)        # dos dedos en el trackpad: mover
+            return
+        # zoom en pasos enteros; el pellizco manda poquito a la vez: se acumula
+        self.rueda_acum = getattr(self, "rueda_acum", 0) + ev.delta
+        if abs(self.rueda_acum) < 120:
+            return
+        arriba = self.rueda_acum > 0
+        self.rueda_acum = 0
         if self.img_sin_calibrar():
             # zoom alrededor del cursor
             px, py = self.pantalla_a_img(ev.x, ev.y)

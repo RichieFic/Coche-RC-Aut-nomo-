@@ -215,6 +215,9 @@ class Dashboard:
         self.mapa.bind("<Button-1>", self.clic_mapa)
         self.mapa.bind("<Button-3>", lambda e: self.quitar_punto())
         self.mapa.bind("<MouseWheel>", self.rueda_mapa)
+        self.mapa.bind("<Shift-MouseWheel>", self.rueda_mapa_h)
+        self.mapa.bind("<ButtonPress-2>", self.presion_medio_mapa)
+        self.mapa.bind("<B2-Motion>", self.mover_medio_mapa)
         tk.Label(izq, text="Clic izquierdo: agregar punto · clic derecho: quitar el último · "
                            "rueda: zoom.  El carro arranca en (0, 0) mirando hacia arriba.",
                  bg=T.PANEL, fg=T.TEXTO_TENUE, font=T.FUENTE_UI).pack(anchor="w", padx=8, pady=(0, 6))
@@ -745,9 +748,30 @@ class Dashboard:
         self.guardar_puntos()
         self.seguir.set(False)                 # para que el mapa no se mueva mientras planeas
 
+    def desplazar_mapa(self, dx, dy):
+        """Mueve el contenido del mapa dx, dy pixeles (arriba en pantalla = +x, izquierda = +y)."""
+        self.seguir.set(False)
+        self.centro = [self.centro[0] + dy / self.escala, self.centro[1] + dx / self.escala]
+
     def rueda_mapa(self, ev):
-        factor = 1.15 if ev.delta > 0 else 1 / 1.15
+        if not mapa_gps.es_zoom(ev):
+            self.desplazar_mapa(0, ev.delta)   # dos dedos en el trackpad: mover
+            return
+        factor = 1.15 ** (ev.delta / 120.0)    # rueda: un paso; pellizco: poquito
         self.escala = min(800.0, max(20.0, self.escala * factor))
+
+    def rueda_mapa_h(self, ev):
+        self.desplazar_mapa(ev.delta, 0)
+
+    def presion_medio_mapa(self, ev):
+        self.arrastre_medio = (ev.x, ev.y)
+
+    def mover_medio_mapa(self, ev):
+        """Arrastrar con la rueda presionada: mover el mapa."""
+        if getattr(self, "arrastre_medio", None):
+            x0, y0 = self.arrastre_medio
+            self.desplazar_mapa(ev.x - x0, ev.y - y0)
+            self.arrastre_medio = (ev.x, ev.y)
 
     def dibujar_mapa(self):
         c = self.mapa
