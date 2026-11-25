@@ -24,7 +24,7 @@ import threading
 import time
 import tkinter as tk
 import urllib.request
-from tkinter import filedialog, simpledialog, ttk
+from tkinter import filedialog, messagebox, simpledialog, ttk
 
 import tema_oscuro as T
 
@@ -515,7 +515,16 @@ class MapaGPS(tk.Frame):
             self.ruta.pop()
             self.guardar_ruta()
 
-    def borrar_ruta(self):
+    def borrar_ruta(self, confirmar=True):
+        if self.ruta and confirmar:
+            if not messagebox.askyesno("Borrar ruta", f"¿Borrar los {len(self.ruta)} puntos de la ruta GPS?\n\n"
+                                       "Se guarda una copia en mapas/ruta_reto_borrada.json.", parent=self):
+                return
+            try:
+                json.dump({"x0": self.x0, "psi0": self.psi0, "ruta": self.ruta},
+                          open(ARCHIVO_RUTA.replace(".json", "_borrada.json"), "w", encoding="utf-8"))
+            except OSError:
+                pass
         self.ruta.clear()
         self.guardar_ruta()
 

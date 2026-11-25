@@ -26,7 +26,7 @@ import sys
 import threading
 import time
 import tkinter as tk
-from tkinter import ttk
+from tkinter import messagebox, ttk
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import control_carro as cc                     # noqa: E402  (puertos, Xbox, mezcla)
@@ -548,7 +548,18 @@ class Dashboard:
             self.puntos.pop()
             self.guardar_puntos()
 
-    def borrar_puntos(self):
+    def borrar_puntos(self, confirmar=True):
+        if self.puntos and confirmar:
+            if not messagebox.askyesno(
+                    "Borrar puntos", f"¿Borrar los {len(self.puntos)} puntos de la ruta?\n\n"
+                    "Se guarda una copia en mapas/ruta_odometria_borrada.json.", parent=self.root):
+                return
+            try:                               # copia por si fue un error
+                with open(self.archivo_puntos().replace(".json", "_borrada.json"), "w",
+                          encoding="utf-8") as f:
+                    json.dump({"puntos": self.puntos}, f)
+            except OSError:
+                pass
         self.puntos.clear()
         self.guardar_puntos()
         self.escribir("#WC")
