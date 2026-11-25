@@ -217,6 +217,7 @@ class XINPUT_STATE(ctypes.Structure):
 BOTON_A, BOTON_B, BOTON_X, BOTON_Y = 0x1000, 0x2000, 0x4000, 0x8000
 BOTON_BACK = 0x0020
 BOTON_RB = 0x0200
+BOTON_LB = 0x0100          # dashboard: grabar el punto donde esta el carro
 
 
 def cargar_xinput():
@@ -275,6 +276,8 @@ class ControlXbox:
             letras.append("G")
         if nuevos & BOTON_RB:
             letras.append("ASIST")
+        if nuevos & BOTON_LB:
+            letras.append("PUNTO")
         salir = bool(nuevos & BOTON_BACK)
         return acel, giro, letras, salir
 
@@ -614,6 +617,8 @@ def main():
                 break
 
             for letra in letras:
+                if letra == "PUNTO":
+                    continue
                 if letra == "ASIST":
                     asistencia = not asistencia
                     puerto.escribir(b"#H1\n" if asistencia else b"#H0\n")

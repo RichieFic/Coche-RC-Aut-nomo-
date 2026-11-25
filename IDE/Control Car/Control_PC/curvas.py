@@ -22,6 +22,8 @@ import math
 
 RADIO_M = 0.5            # radio aproximado del arco
 GIRO_MIN_DEG = 20.0      # esquinas mas suaves que esto se dejan igual
+GIRO_MAX_DEG = 100.0     # esquinas mas cerradas (vueltas en U) no se redondean: el arco
+                         # quedaria lejos del punto; ahi el carro para y pivota
 MAX_PUNTOS = 40          # lo que acepta el firmware
 
 
@@ -34,10 +36,10 @@ def _arco(a, c, b, radio, n):
     u1 = ((c[0] - a[0]) / l1, (c[1] - a[1]) / l1)
     u2 = ((b[0] - c[0]) / l2, (b[1] - c[1]) / l2)
     giro = math.degrees(math.acos(max(-1.0, min(1.0, u1[0] * u2[0] + u1[1] * u2[1]))))
-    if giro < GIRO_MIN_DEG:
+    if giro < GIRO_MIN_DEG or giro > GIRO_MAX_DEG:
         return None
-    d = radio * math.tan(math.radians(min(giro, 170.0)) / 2)
-    d = min(d, 0.45 * l1, 0.45 * l2)
+    d = radio * math.tan(math.radians(giro) / 2)
+    d = min(d, radio, 0.45 * l1, 0.45 * l2)   # el arco nunca a mas de ~radio de la esquina
     t1 = (c[0] - u1[0] * d, c[1] - u1[1] * d)
     t2 = (c[0] + u2[0] * d, c[1] + u2[1] * d)
     pts = []

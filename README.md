@@ -130,6 +130,15 @@ Avanzando sigue la **línea** entre puntos (pure pursuit: apunta 50 cm adelante 
 - `python replay_odometria.py registros/crudo_<fecha>.log` vuelve a correr `OdometriaPaso()` sin ventana: primero verifica que con las mismas constantes da la misma pose, y luego permite probar otras (`--escala`, `--escala-der/--escala-izq`, `--yaw-encoders`), barridos en paralelo (`--barrido 0.94:1.00:0.005 --jobs 8`) y exportar a AdvantageScope (`--advantagescope salida.csv`).
 - El replay cambia la **estimación**, no el movimiento: para saber cómo se habría movido el carro con otra ganancia hace falta la simulación (fases siguientes).
 
+#### Grabar la ruta manejando (teach and repeat)
+
+1. Carro en la X y *Reiniciar origen*.
+2. Manejarlo (W/A/S/D o control de Xbox) por el recorrido y en cada waypoint presionar **P**, el botón **LB** del control o *● Grabar punto*: se guarda donde está el carro según la odometría (puntos a menos de 15 cm del anterior se ignoran).
+3. *+ X* agrega la X (0, 0) como último punto.
+4. Carro otra vez en la X, con el mismo rumbo, *Reiniciar origen* y *Ejecutar ruta*.
+
+La ruta (grabada o con clic) se guarda en `Control_PC/mapas/ruta_odometria.json` y se vuelve a cargar al abrir el dashboard. Las esquinas de más de 100° (vueltas en U) no se redondean: ahí el carro para y pivota.
+
 #### Pestaña Mapa GPS (reto final)
 
 Mapa del campus con la posición GPS (punto amarillo, círculo de error según el HDOP, rastro), la ruta planeada y el carro estimado por la odometría.

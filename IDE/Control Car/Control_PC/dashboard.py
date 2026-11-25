@@ -18,6 +18,7 @@ y = hacia la izquierda (el marco de la odometria del firmware).
 import argparse
 import collections
 import csv
+import json
 import math
 import os
 import re
@@ -91,6 +92,7 @@ class Dashboard:
         except (OSError, ValueError):
             pass
         self.cal_mag = None                     # muestras durante la calibracion
+        self.cargar_puntos()                   # ruta de la sesion anterior (grabada o con clic)
         self.aviso_gyro = False
         self.log_seq = None
         self.log_tramas = 0
@@ -195,6 +197,9 @@ class Dashboard:
         ttk.Button(botones, text="Detener ruta", command=lambda: self.escribir("#WS")).pack(side="left", padx=3)
         ttk.Button(botones, text="Quitar último", command=self.quitar_punto).pack(side="left", padx=3)
         ttk.Button(botones, text="Borrar puntos", command=self.borrar_puntos).pack(side="left", padx=3)
+        ttk.Button(botones, text="● Grabar punto (P / LB)", style="Accion.TButton",
+                   command=self.grabar_punto).pack(side="left", padx=3)
+        ttk.Button(botones, text="+ X", width=4, command=self.cerrar_en_x).pack(side="left", padx=3)
         ttk.Button(botones, text="Reiniciar origen", command=self.reiniciar_origen).pack(side="left", padx=3)
         ttk.Checkbutton(botones, text="Seguir al carro", variable=self.seguir,
                         style="Panel.TCheckbutton").pack(side="left", padx=8)
@@ -489,12 +494,63 @@ class Dashboard:
             return
         self.enviar_ruta(list(self.puntos[:20]))
 
+    def grabar_punto(self):
+        """Teach and repeat: agrega a la ruta el punto donde esta el carro ahora
+        (odometria). Antes de empezar: carro en la X y 'Reiniciar origen'."""
+        if not self.pose:
+            self.mensajes.append("RUTA: no hay posicion del carro todavia")
+            return
+        if self.pose["md"] == "RUTA":
+            return                             # no grabar mientras recorre la ruta
+        x, y = round(self.pose["x"], 2), round(self.pose["y"], 2)
+        if self.puntos and math.hypot(x - self.puntos[-1][0], y - self.puntos[-1][1]) < 0.15:
+            self.mensajes.append("RUTA: muy cerca del punto anterior; no se grabo")
+            return
+        if len(self.puntos) >= 20:
+            self.mensajes.append("RUTA: maximo 20 puntos")
+            return
+        self.puntos.append((x, y))
+        self.seguir.set(True)
+        self.mensajes.append(f"RUTA: punto {len(self.puntos)} grabado en ({x:+.2f}, {y:+.2f})")
+        self.guardar_puntos()
+
+    def cerrar_en_x(self):
+        """Ultimo punto = la X (el origen)."""
+        if self.puntos and math.hypot(*self.puntos[-1]) < 0.05:
+            return
+        self.puntos.append((0.0, 0.0))
+        self.mensajes.append(f"RUTA: punto {len(self.puntos)} = la X (0, 0)")
+        self.guardar_puntos()
+
+    def archivo_puntos(self):
+        return os.path.join(os.path.dirname(os.path.abspath(__file__)), "mapas", "ruta_odometria.json")
+
+    def guardar_puntos(self):
+        try:
+            os.makedirs(os.path.dirname(self.archivo_puntos()), exist_ok=True)
+            with open(self.archivo_puntos(), "w", encoding="utf-8") as f:
+                json.dump({"puntos": self.puntos}, f)
+        except OSError:
+            pass
+
+    def cargar_puntos(self):
+        try:
+            with open(self.archivo_puntos(), encoding="utf-8") as f:
+                self.puntos = [tuple(p) for p in json.load(f)["puntos"]][:20]
+        except (OSError, ValueError, KeyError, TypeError):
+            return
+        if self.puntos:
+            self.mensajes.append(f"RUTA: {len(self.puntos)} puntos de la sesion anterior "
+                                 "(Borrar puntos para empezar otra)")
+
     def quitar_punto(self):
         if self.puntos:
             self.puntos.pop()
+            self.guardar_puntos()
 
     def borrar_puntos(self):
         self.puntos.clear()
+        self.guardar_puntos()
         self.escribir("#WC")
 
     def reiniciar_origen(self):
@@ -519,6 +575,8 @@ class Dashboard:
                 self.parar_todo()
             elif k == "h":
                 self.alternar_asistencia()
+        if k == "p":
+            self.grabar_punto()
         if k == "escape":
             self.parar_todo()
 
@@ -539,7 +597,9 @@ class Dashboard:
         elif modo == "xbox" and self.xbox is not None:
             acel, giro, letras, _ = self.xbox.leer()
             for letra in letras:
-                if letra == "ASIST":
+                if letra == "PUNTO":
+                    self.grabar_punto()
+                elif letra == "ASIST":
                     self.alternar_asistencia()
                 elif letra == "S":
                     self.parar_todo()
@@ -671,6 +731,7 @@ class Dashboard:
             return
         x, y = self.a_mundo(ev.x, ev.y)
         self.puntos.append((round(x, 2), round(y, 2)))
+        self.guardar_puntos()
         self.seguir.set(False)                 # para que el mapa no se mueva mientras planeas
 
     def rueda_mapa(self, ev):
