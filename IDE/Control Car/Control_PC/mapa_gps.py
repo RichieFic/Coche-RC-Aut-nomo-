@@ -186,6 +186,7 @@ class MapaGPS(tk.Frame):
                         style="Panel.TRadiobutton", command=self.cambio_fondo).pack(side="left", padx=4)
         ttk.Button(b2, text="Cargar imagen…", command=self.cargar_imagen).pack(side="left", padx=3)
         ttk.Button(b2, text="Calibrar imagen", command=self.calibrar).pack(side="left", padx=3)
+        ttk.Button(b2, text="Centrar imagen", command=self.centrar_imagen).pack(side="left", padx=3)
         ttk.Button(b2, text="Descargar zona", command=self.descargar).pack(side="left", padx=3)
         ttk.Button(b2, text="Centrar en GPS", command=self.centrar_gps).pack(side="left", padx=3)
         ttk.Button(b2, text="Ajustar a la ruta", command=self.ajustar_vista).pack(side="left", padx=3)
@@ -310,6 +311,7 @@ class MapaGPS(tk.Frame):
         self.img_ruta = ruta
         self.img_cache = {}
         self.img_nivel = 0
+        self.img_vista = None             # esquina de la imagen en pantalla (sin calibrar); None = centrar
         try:
             self.img_cal = json.load(open(self.ruta_img_json(ruta), encoding="utf-8"))
             self.preparar_cal()
@@ -336,6 +338,34 @@ class MapaGPS(tk.Frame):
     def factor_img(self):
         return self.FACTORES[max(0, min(len(self.FACTORES) - 1, 3 + self.img_nivel))]
 
+    def nivel_para_caber(self, w, h):
+        """El zoom mas grande con el que la imagen completa cabe en el mapa."""
+        for nivel in range(3, -4, -1):
+            self.img_nivel = nivel
+            f = self.factor_img()
+            if self.img.width() * f <= w and self.img.height() * f <= h:
+                return
+
+    def pantalla_a_img(self, sx, sy):
+        """Pixel de pantalla -> pixel de la imagen (imagen sin calibrar)."""
+        f = self.factor_img()
+        return (sx - self.img_vista[0]) / f, (sy - self.img_vista[1]) / f
+
+    def centrar_imagen(self):
+        if self.img is None:
+            self.d.mensajes.append("MAPA: primero carga una imagen")
+            return
+        self.modo_fondo.set("img")
+        self.seguir.set(False)
+        if self.img_cal:
+            # centro de la imagen en coordenadas del mapa, con la imagen completa a la vista
+            g0x = self.img_g1[0] - self.img_p1[0] * self.img_s
+            g0y = self.img_g1[1] - self.img_p1[1] * self.img_s
+            self.centro = (g0x + self.img.width() / 2 * self.img_s, g0y + self.img.height() / 2 * self.img_s)
+            self.nivel_para_caber(*self.tam())
+        else:
+            self.img_vista = None
+
     def imagen_escalada(self):
         f = self.factor_img()
         if f not in self.img_cache:
@@ -348,8 +378,12 @@ class MapaGPS(tk.Frame):
                           fill=T.TEXTO_TENUE, font=("Segoe UI", 11))
             return
         if not self.img_cal:
-            # Sin calibrar: se muestra 1:1 para poder marcar los dos puntos
-            c.create_image(0, 0, image=self.img, anchor="nw")
+            # Sin calibrar: se puede mover (arrastrar) y hacer zoom (rueda)
+            if self.img_vista is None:
+                self.nivel_para_caber(w, h)
+                f = self.factor_img()
+                self.img_vista = [(w - self.img.width() * f) / 2, (h - self.img.height() * f) / 2]
+            c.create_image(self.img_vista[0], self.img_vista[1], image=self.imagen_escalada(), anchor="nw")
             return
         k = self.escala()
         # esquina (0, 0) de la imagen en pixel global z0
@@ -365,6 +399,7 @@ class MapaGPS(tk.Frame):
             return
         self.modo_fondo.set("img")
         self.img_cal = None
+        self.img_vista = None
         self.cal_tmp = []
         self.poner_accion("cal1")
 
@@ -380,20 +415,20 @@ class MapaGPS(tk.Frame):
         except ValueError as e:
             self.d.mensajes.append(f"MAPA: coordenada no valida ({e})")
             return
-        self.cal_tmp.append([ev.x, ev.y, lat, lon])
+        px, py = self.pantalla_a_img(ev.x, ev.y)
+        self.cal_tmp.append([px, py, lat, lon])
         if len(self.cal_tmp) == 1:
             self.poner_accion("cal2")
             return
         p1, p2 = self.cal_tmp
-        if math.hypot(p2[0] - p1[0], p2[1] - p1[1]) < 50:
+        if math.hypot(p2[0] - p1[0], p2[1] - p1[1]) < 30:
             self.d.mensajes.append("MAPA: los dos puntos deben estar lejos uno del otro; repite")
             self.calibrar()
             return
         self.img_cal = {"p1": p1, "p2": p2}
         json.dump(self.img_cal, open(self.ruta_img_json(self.img_ruta), "w", encoding="utf-8"))
         self.preparar_cal()
-        self.img_nivel = 0
-        self.centro = a_global(p1[2], p1[3])
+        self.centrar_imagen()
         self.d.mensajes.append("MAPA: imagen calibrada")
         self.poner_accion("ruta")
 
@@ -405,21 +440,30 @@ class MapaGPS(tk.Frame):
         "ruta": "Clic: agregar punto del recorrido · clic derecho: quitar el último · arrastrar: mover · rueda: zoom",
         "x": "Haz clic EXACTAMENTE en la X (salida y meta)",
         "dir": "Haz clic en un punto hacia donde apunta el frente del carro en la X",
-        "cal1": "Calibrar: clic en un punto fácil de reconocer de la imagen (esquina de un edificio)",
-        "cal2": "Calibrar: clic en un segundo punto, lejos del primero",
+        "cal1": "Calibrar: clic en un punto fácil de reconocer (esquina de un edificio) · arrastrar: mover · rueda: zoom",
+        "cal2": "Calibrar: clic en un segundo punto, lejos del primero · arrastrar: mover · rueda: zoom",
     }
 
     def poner_accion(self, accion):
         self.accion = accion
 
+    def img_sin_calibrar(self):
+        return self.modo_fondo.get() == "img" and self.img is not None and not self.img_cal \
+            and self.img_vista is not None
+
     def presion(self, ev):
-        self.arrastre = (ev.x, ev.y, self.centro, False)
+        inicio = list(self.img_vista) if self.img_sin_calibrar() else self.centro
+        self.arrastre = (ev.x, ev.y, inicio, False)
 
     def mover(self, ev):
         if not self.arrastre:
             return
         x0, y0, c0, movido = self.arrastre
         if movido or abs(ev.x - x0) + abs(ev.y - y0) > 6:
+            if self.img_sin_calibrar():
+                self.img_vista = [c0[0] + (ev.x - x0), c0[1] + (ev.y - y0)]
+                self.arrastre = (x0, y0, c0, True)
+                return
             k = self.escala()
             self.centro = (c0[0] - (ev.x - x0) / k, c0[1] - (ev.y - y0) / k)
             self.arrastre = (x0, y0, c0, True)
@@ -454,6 +498,13 @@ class MapaGPS(tk.Frame):
 
     def rueda(self, ev):
         arriba = ev.delta > 0
+        if self.img_sin_calibrar():
+            # zoom alrededor del cursor
+            px, py = self.pantalla_a_img(ev.x, ev.y)
+            self.img_nivel = max(-3, min(3, self.img_nivel + (1 if arriba else -1)))
+            f = self.factor_img()
+            self.img_vista = [ev.x - px * f, ev.y - py * f]
+            return
         if self.modo_fondo.get() == "img" and self.img_cal:
             self.img_nivel = max(-3, min(3, self.img_nivel + (1 if arriba else -1)))
         else:
