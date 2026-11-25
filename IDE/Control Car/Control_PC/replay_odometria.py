@@ -84,9 +84,35 @@ def delta16(a, b):
     return d - 0x10000 if d >= 0x8000 else d
 
 
+# Detector de huecos del encoder (igual que ODO_HUECO_* en main.c): si una rueda
+# cuenta casi cero mientras la otra cuenta normal y el giroscopio NO ve que el
+# carro gire, el encoder se salto cuentas: se usa la rueda buena para las dos.
+HUECO_MIN_CUENTAS = 30         # la rueda buena debe contar mas que esto en el paso (20 ms)
+HUECO_FRACCION = 0.5           # la mala cuenta a lo mas esta fraccion de la buena
+HUECO_GIRO_MAX_DPS = 30.0      # el carro casi no gira segun el giroscopio...
+HUECO_GIRO_VECES = 3.0         # ...y las ruedas "dicen" que giro mas de 3x lo que mide el giroscopio
+PASO_S = 0.020                 # periodo de la odometria (ODO_PERIODO_MS)
+
+
+def corregir_hueco(d3, d4, rate_dps, m_por_cuenta=M_POR_CUENTA, via_m=TRACK_WIDTH_M, dt=PASO_S):
+    """Regresa (d3, d4, hubo_hueco) con la rueda que se salto cuentas corregida."""
+    if abs(rate_dps) >= HUECO_GIRO_MAX_DPS:
+        return d3, d4, False
+    if dt <= 0:
+        return d3, d4, False
+    w_ruedas = math.degrees((d3 - d4) * m_por_cuenta / via_m / dt)
+    if abs(w_ruedas) <= HUECO_GIRO_VECES * abs(rate_dps) + 15.0:
+        return d3, d4, False           # la diferencia entre ruedas la confirma el giroscopio
+    if abs(d3) > HUECO_MIN_CUENTAS and abs(d4) <= HUECO_FRACCION * abs(d3):
+        return d3, d3, True
+    if abs(d4) > HUECO_MIN_CUENTAS and abs(d3) <= HUECO_FRACCION * abs(d4):
+        return d4, d4, True
+    return d3, d4, False
+
+
 # ------------------------------------------------------------------ replay
 def replay(tramas, escala_der=ODO_ESCALA, escala_izq=ODO_ESCALA, m_por_cuenta=M_POR_CUENTA,
-           yaw_encoders=False, via_m=TRACK_WIDTH_M):
+           yaw_encoders=False, via_m=TRACK_WIDTH_M, detector=True, contar=None):
     """Mismo calculo que OdometriaPaso(). Regresa una lista de (t_s, x, y, th_deg)
     alineada con tramas, y el numero de huecos (tramas perdidas)."""
     salida = []
@@ -112,6 +138,11 @@ def replay(tramas, escala_der=ODO_ESCALA, escala_izq=ODO_ESCALA, m_por_cuenta=M_
             x = y = th = 0.0
             th0 = yaw_gyro - tr["th_cdeg"] / 100.0
             yaw_enc = 0.0
+        if detector:
+            d3, d4, hubo = corregir_hueco(d3, d4, tr["rate_cdps"] / 100.0,
+                                          dt=(tr["t_ms"] - anterior["t_ms"]) / 1000.0)
+            if hubo and contar is not None:
+                contar[0] += 1
         ds = ((d3 * escala_der) + (d4 * escala_izq)) * 0.5 * m_por_cuenta
         if yaw_encoders:
             yaw_enc += math.degrees(((d3 * escala_der) - (d4 * escala_izq)) * m_por_cuenta / via_m)
@@ -198,12 +229,21 @@ def main():
           f"tramo {idx}: {len(seg)} tramas, {dur:.1f} s")
 
     # 1) Verificacion: mismas constantes -> misma pose que el firmware
-    salida, huecos = replay(tramas)
-    ep, et = comparar(tramas, salida, seg)
+    # El firmware nuevo corrige los huecos del encoder; los registros viejos no.
+    salida_sin, huecos = replay(tramas, detector=False)
+    n_det = [0]
+    salida_con, _ = replay(tramas, detector=True, contar=n_det)
+    ep_sin, et_sin = comparar(tramas, salida_sin, seg)
+    ep_con, et_con = comparar(tramas, salida_con, seg)
+    sin_det = ep_sin <= ep_con
+    salida, ep, et = (salida_sin, ep_sin, et_sin) if sin_det else (salida_con, ep_con, et_con)
     tr = tramas[seg[-1]]
-    print(f"Verificacion del replay (mismas constantes): error max {ep:.1f} mm, {et:.2f} grados, "
-          f"{huecos} huecos en todo el registro")
+    print(f"Verificacion del replay (mismas constantes, firmware {'SIN' if sin_det else 'CON'} detector de "
+          f"huecos): error max {ep:.1f} mm, {et:.2f} grados, {huecos} tramas perdidas en todo el registro")
     print(f"  firmware: x={tr['x_mm'] / 1000:+.3f} y={tr['y_mm'] / 1000:+.3f} th={tr['th_cdeg'] / 100:+.1f}")
+    _, xc, yc, thc = salida_con[seg[-1]]
+    print(f"  huecos del encoder detectados: {n_det[0]} pasos; con el detector la odometria daria "
+          f"x={xc:+.3f} y={yc:+.3f} (a {math.hypot(xc, yc):.2f} m del origen)")
 
     # 2) Con las constantes pedidas
     ed = a.escala_der or a.escala or ODO_ESCALA

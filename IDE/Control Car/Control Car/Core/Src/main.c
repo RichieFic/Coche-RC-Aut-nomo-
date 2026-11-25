@@ -189,6 +189,13 @@ uint8_t odo_iniciada = 0U;
 uint8_t log_entradas = 0U;
 uint16_t log_seq = 0U;
 uint8_t odo_reinicios = 0U;            /* cuantas veces se reinicio la odometria (#O) */
+/* Huecos del encoder (2026-11-25: el izquierdo perdio ~12 % de cuentas en una
+ * vuelta de 127 m y el carro cerro a 1.4 m creyendo 0.04 m). */
+#define ODO_HUECO_MIN_CUENTAS  30      /* la rueda buena cuenta mas que esto en el paso */
+#define ODO_HUECO_FRACCION     0.5f    /* la mala cuenta a lo mas esta fraccion */
+#define ODO_HUECO_GIRO_MAX_DPS 30.0f   /* el giroscopio casi no ve giro... */
+#define ODO_HUECO_GIRO_VECES   3.0f    /* ...y las ruedas dicen que giro > 3x eso + 15 dps */
+uint32_t odo_huecos = 0U;              /* pasos corregidos (se manda como ef= en P:) */
 volatile uint8_t log_rx = 0xFFU;       /* 0/1 recibido por la interrupcion */
 volatile uint8_t odo_rx_reset = 0U;
 float us_ultima_cm = -1.0f;            /* ultima lectura del ultrasonico (-1 = sin eco) */
@@ -1387,6 +1394,30 @@ static void OdometriaPaso(void)
     odo_prev3 = c3;
     odo_prev4 = c4;
 
+    /* Detector de huecos del encoder: si una rueda cuenta casi cero mientras la
+     * otra cuenta normal y el giroscopio NO ve que el carro gire, ese encoder se
+     * salto cuentas (cable/ruido): se usa la rueda buena para las dos. */
+    if ((gyro_ok != 0U) && (giro_fuente == GIRO_FUENTE_GYRO) && (dt > 0.0f))
+    {
+        float w_gyro = fabsf(RateFuenteDps());
+        float w_ruedas = fabsf(((float)(d3 - d4)) * distance_per_count / TRACK_WIDTH_M / dt) * 57.2957795f;
+        if ((w_gyro < ODO_HUECO_GIRO_MAX_DPS) &&
+            (w_ruedas > ((ODO_HUECO_GIRO_VECES * w_gyro) + 15.0f)))
+        {
+            int16_t a3 = (d3 < 0) ? (int16_t)(-d3) : d3;
+            int16_t a4 = (d4 < 0) ? (int16_t)(-d4) : d4;
+            if ((a3 > ODO_HUECO_MIN_CUENTAS) && ((float)a4 <= (ODO_HUECO_FRACCION * (float)a3)))
+            {
+                d4 = d3;
+                odo_huecos++;
+            }
+            else if ((a4 > ODO_HUECO_MIN_CUENTAS) && ((float)a3 <= (ODO_HUECO_FRACCION * (float)a4)))
+            {
+                d3 = d4;
+                odo_huecos++;
+            }
+        }
+    }
     /* Adelante ambos encoders suben: el promedio con signo es el avance. */
     ds = (((float)d3 * ODO_ESCALA_DER) + ((float)d4 * ODO_ESCALA_IZQ)) * 0.5f * distance_per_count;
     th_nuevo = YawFuenteDeg() - odo_theta0_deg;
@@ -1433,7 +1464,7 @@ static void OdometriaPaso(void)
         odo_telemetria_ms = ahora;
         snprintf(linea, sizeof(linea),
                  "P: x=%ld y=%ld th=%ld v=%ld rd=%ld ri=%ld pd=%ld pi=%ld us=%ld md=%s wp=%u/%u"
-                 " mg=%ld mv=%u mx=%ld my=%ld mz=%ld gy=%u\r\n",
+                 " mg=%ld mv=%u mx=%ld my=%ld mz=%ld gy=%u ef=%lu\r\n",
                  (long)(odo_x_m * 1000.0f), (long)(odo_y_m * 1000.0f),
                  (long)(odo_theta_deg * 10.0f), (long)(odo_v_ms * 1000.0f),
                  (long)(rpm_motor_derecho * 10.0f), (long)(rpm_motor_izquierdo * 10.0f),
@@ -1442,7 +1473,8 @@ static void OdometriaPaso(void)
                  (unsigned int)ruta_idx, (unsigned int)ruta_n,
                  (long)(imu_mag_norte_deg * 10.0f), (unsigned int)imu_mag_norte_ok,
                  (long)(mv3[0] * 10.0f), (long)(mv3[1] * 10.0f), (long)(mv3[2] * 10.0f),
-                 (unsigned int)(((gyro_ok != 0U) && (giro_fuente == GIRO_FUENTE_GYRO)) ? 1U : 0U));
+                 (unsigned int)(((gyro_ok != 0U) && (giro_fuente == GIRO_FUENTE_GYRO)) ? 1U : 0U),
+                 (unsigned long)odo_huecos);
         EnviarMensajeDebug(linea);
     }
 }

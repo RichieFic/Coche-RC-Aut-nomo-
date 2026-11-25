@@ -94,6 +94,8 @@ class Dashboard:
         self.cal_mag = None                     # muestras durante la calibracion
         self.cargar_puntos()                   # ruta de la sesion anterior (grabada o con clic)
         self.aviso_gyro = False
+        self.ef_avisado = None                 # huecos del encoder ya reportados
+        self.ef_aviso_t = 0.0
         self.log_seq = None
         self.log_tramas = 0
         self.log_perdidas = 0
@@ -375,6 +377,21 @@ class Dashboard:
         self.escribir("#M0,0")
         self.escribir("#G")
         self.mensajes.append("GYRO: recalibrando... no muevas el carro unos segundos")
+
+    def avisar_encoder(self):
+        """Avisa (cada 5 s como mucho) si el firmware corrigio huecos del encoder."""
+        p = self.pose
+        if not p or p.get("ef") is None:
+            return
+        if self.ef_avisado is None or p["ef"] < self.ef_avisado:
+            self.ef_avisado = p["ef"]          # primera lectura o el carro se reinicio
+            return
+        nuevos = p["ef"] - self.ef_avisado
+        if nuevos > 0 and time.monotonic() - self.ef_aviso_t > 5.0:
+            self.mensajes.append(f"AVISO ENCODER: {nuevos} huecos corregidos ({p['ef']} en total); "
+                                 "un encoder se salta cuentas: revisa cable, conector y alimentacion")
+            self.ef_avisado = p["ef"]
+            self.ef_aviso_t = time.monotonic()
 
     def avisar_giroscopio(self):
         """Aviso una vez si el carro reporta el giroscopio sin calibrar."""
@@ -683,7 +700,8 @@ class Dashboard:
                      "v": int(c["v"]) / 1000.0, "rd": int(c["rd"]) / 10.0, "ri": int(c["ri"]) / 10.0,
                      "pd": int(c["pd"]) / 10.0, "pi": int(c["pi"]) / 10.0, "us": int(c["us"]) / 10.0,
                      "md": c.get("md", "?"), "wp": c.get("wp", "0/0"),
-                     "gy": (c["gy"] == "1") if "gy" in c else None}
+                     "gy": (c["gy"] == "1") if "gy" in c else None,
+                     "ef": int(c["ef"]) if c.get("ef", "").isdigit() else None}
             except (KeyError, ValueError):
                 return
             t = time.monotonic() - self.t0
@@ -946,6 +964,7 @@ class Dashboard:
         })
 
         self.avisar_giroscopio()
+        self.avisar_encoder()
         t_fin = time.monotonic() - self.t0
         self.g_th.dibujar(t_fin, [(q[0], q[1]) for q in s])
         self.g_v.dibujar(t_fin, [(q[0], q[2]) for q in s])
