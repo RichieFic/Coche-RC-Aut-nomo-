@@ -228,6 +228,11 @@ float us_ultima_cm = -1.0f;            /* ultima lectura del ultrasonico (-1 = s
 #define RUTA_AVANCE_CURVA      55      /* % maximo en las curvas (a 80 % se satura la direccion) */
 #define RUTA_SEG_CURVA_M       0.6f    /* tramo mas corto que esto = parte de un arco */
 #define RUTA_ANTES_CURVA_M     0.4f    /* bajar la velocidad desde esta distancia antes del arco */
+#define RUTA_PASADA_MARGEN_M   0.01f   /* "ya pase": a mas de esto de la distancia minima alcanzada */
+#define RUTA_GYRO_MAX_MS       300U    /* sin lecturas del giroscopio por mas de esto: detener la ruta */
+#define RUTA_GIRO_MAX_MS       6000U   /* un pivote que dura mas que esto: detener (rueda atorada?) */
+#define RUTA_SIN_AVANCE_MS     10000U  /* sin acercarse 5 cm al punto en este tiempo: detener */
+#define RUTA_AVANCE_MIN_M      0.05f
 #define RUTA_FRENADO_FINAL_M   0.80f   /* ...y se llega frenando desde mas lejos */
 #define RUTA_PASADA_M          0.15f   /* si ya esta a menos de esto y se aleja, llego */
 /* Rumbo magnetico (IMU de canto): desfase entre el eje de referencia de la
@@ -249,8 +254,11 @@ float ruta_ax = 0.0f;               /* inicio del tramo actual (m, marco de la o
 float ruta_ay = 0.0f;
 uint8_t ruta_esperando = 0U;
 uint32_t ruta_espera_desde = 0U;
-float ruta_dist_prev = 1000.0f;
+float ruta_dist_prev = 1000.0f;       /* distancia MINIMA alcanzada al punto actual */
 uint8_t ruta_alejando = 0U;
+uint32_t ruta_giro_desde = 0U;         /* inicio del pivote actual */
+float ruta_chk_dist = 1000.0f;         /* vigilancia de avance: ultima distancia que mejoro 5 cm */
+uint32_t ruta_chk_ms = 0U;
 volatile int32_t ruta_rx_espera = -1;
 float imu_mag_norte_deg = 0.0f;     /* rumbo del frente, horario desde el norte */
 uint8_t imu_mag_norte_ok = 0U;
@@ -1407,7 +1415,8 @@ static void OdometriaPaso(void)
      * con MENOS cuentas se salto cuentas (un encoder que falla solo pierde) y se
      * reconstruye desde la otra rueda y el giroscopio. Solo casi en linea recta:
      * en curvas el patinaje del carro de 4 ruedas varia y daria falsos huecos. */
-    if ((gyro_ok != 0U) && (giro_fuente == GIRO_FUENTE_GYRO) && (dt > 0.0f))
+    if ((gyro_ok != 0U) && (giro_fuente == GIRO_FUENTE_GYRO) && (dt > 0.0f) &&
+        ((ahora - gyro_last_ok_ms) < 100U))
     {
         float dth = th_nuevo - odo_theta_deg;                  /* grados en el paso, izq + */
         int16_t a3 = (d3 < 0) ? (int16_t)(-d3) : d3;
@@ -1519,6 +1528,15 @@ static void RutaPaso(void)
     if (dt > 0.1f) dt = 0.1f;
     ruta_ultimo_ms = ahora;
 
+    /* Vigilancia: sin giroscopio el rumbo se congela y el carro podria pivotar sin fin. */
+    if ((ahora - gyro_last_ok_ms) > RUTA_GYRO_MAX_MS)
+    {
+        StopMotors();
+        ruta_activa = 0U;
+        EnviarMensajeDebug("RUTA: detenida, el giroscopio dejo de responder\r\n");
+        return;
+    }
+
     if (ruta_idx >= ruta_n)
     {
         StopMotors();
@@ -1535,6 +1553,8 @@ static void RutaPaso(void)
             char m[50];
             ruta_esperando = 0U;
             ruta_tramo_ms = ahora;
+            ruta_chk_dist = 1000.0f;
+            ruta_chk_ms = ahora;
             ruta_integral = 0.0f;
             ruta_quieto = 0U;
             ruta_girando = 0U;
@@ -1565,6 +1585,8 @@ static void RutaPaso(void)
             ruta_idx++;
             ruta_dist_prev = 1000.0f;
             ruta_alejando = 0U;
+            ruta_chk_dist = 1000.0f;
+            ruta_chk_ms = ahora;
             return;
         }
     }
@@ -1585,15 +1607,9 @@ static void RutaPaso(void)
     }
 
     /* Parada: si ya estaba muy cerca y empieza a alejarse, ya paso por ella. */
-    if ((dist < RUTA_PASADA_M) && (dist > (ruta_dist_prev + 0.003f)))
-    {
-        ruta_alejando++;
-    }
-    else if (dist < ruta_dist_prev)
-    {
-        ruta_alejando = 0U;
-    }
-    ruta_dist_prev = dist;
+    if (dist < ruta_dist_prev) ruta_dist_prev = dist;
+    ruta_alejando = ((ruta_dist_prev < RUTA_PASADA_M) &&
+                     (dist > (ruta_dist_prev + RUTA_PASADA_MARGEN_M))) ? 3U : 0U;
 
     /* Todas las paradas a 5 cm (antes 10 en las intermedias): en las curvas, parar
      * 10 cm antes deja al carro fuera del arco y tendria que pivotar. */
@@ -1608,6 +1624,8 @@ static void RutaPaso(void)
         ruta_girando = 0U;
         ruta_dist_prev = 1000.0f;
         ruta_alejando = 0U;
+        ruta_chk_dist = 1000.0f;
+        ruta_chk_ms = ahora;
         StopMotors();
         if (ruta_idx >= ruta_n)
         {
@@ -1699,12 +1717,31 @@ static void RutaPaso(void)
             ruta_tramo_ms = ahora;     /* volver a arrancar suave */
             EnviarMensajeDebug("RUTA: camino libre, continuo\r\n");
         }
-        if (ruta_pausa_obstaculo != 0U) return;
+        if (ruta_pausa_obstaculo != 0U)
+        {
+            ruta_chk_ms = ahora;       /* la pausa no cuenta como "atorado" */
+            return;
+        }
+    }
+
+    /* Vigilancia de avance: cada RUTA_SIN_AVANCE_MS debe acercarse 5 cm al punto. */
+    if (dist < (ruta_chk_dist - RUTA_AVANCE_MIN_M))
+    {
+        ruta_chk_dist = dist;
+        ruta_chk_ms = ahora;
+    }
+    else if ((ahora - ruta_chk_ms) > RUTA_SIN_AVANCE_MS)
+    {
+        StopMotors();
+        ruta_activa = 0U;
+        EnviarMensajeDebug("RUTA: detenida, no avanza hacia el punto (atorado?)\r\n");
+        return;
     }
 
     /* Lejos del rumbo: girar sobre su eje; cerca: avanzar corrigiendo. */
     if ((ruta_girando == 0U) && (fabsf(err_izq) > RUTA_GIRO_ENTRAR_DEG))
     {
+        ruta_giro_desde = ahora;
         ruta_girando = 1U;
         ruta_integral = 0.0f;
         ruta_quieto = 0U;
@@ -1724,6 +1761,13 @@ static void RutaPaso(void)
         /* Girando sobre su eje: PID de angulo (convencion + = derecha),
          * con la potencia limitada para que las ruedas derrapen menos. */
         u = PidAngulo(-err_izq, -RateFuenteDps(), dt, &ruta_integral, &ruta_quieto);
+        if ((ahora - ruta_giro_desde) > RUTA_GIRO_MAX_MS)
+        {
+            StopMotors();
+            ruta_activa = 0U;
+            EnviarMensajeDebug("RUTA: detenida, el pivote no termina (rueda atorada?)\r\n");
+            return;
+        }
         if (u > RUTA_PIVOTE_U_MAX) u = RUTA_PIVOTE_U_MAX;
         if (u < -RUTA_PIVOTE_U_MAX) u = -RUTA_PIVOTE_U_MAX;
         AnguloAplicarSalida(u);
@@ -1840,7 +1884,7 @@ static uint8_t LeerEnteroLinea(const volatile char *s, uint8_t len, uint8_t *pos
     uint8_t negativo = 0U;
     uint8_t digitos = 0U;
     if ((*pos < len) && (s[*pos] == '-')) { negativo = 1U; (*pos)++; }
-    while ((*pos < len) && (s[*pos] >= '0') && (s[*pos] <= '9') && (digitos < 4U))
+    while ((*pos < len) && (s[*pos] >= '0') && (s[*pos] <= '9') && (digitos < 5U))
     {
         v = (v * 10) + (int32_t)(s[*pos] - '0');
         (*pos)++;
@@ -3461,6 +3505,11 @@ int main(void)
         }
         TelePaso();
         /* Odometria y ruta por puntos (dashboard). */
+        if ((odo_rx_reset != 0U) && (ruta_activa != 0U))
+        {
+            odo_rx_reset = 0U;
+            EnviarMensajeDebug("ODO: no se reinicia el origen con la ruta en marcha (detenla primero)\r\n");
+        }
         if (odo_rx_reset != 0U)
         {
             odo_rx_reset = 0U;
@@ -3516,6 +3565,8 @@ int main(void)
                 ruta_ay = odo_y_m;
                 ruta_dist_prev = 1000.0f;
                 ruta_alejando = 0U;
+                ruta_chk_dist = 1000.0f;
+                ruta_chk_ms = HAL_GetTick();
                 ruta_pausa_obstaculo = 0U;
                 ruta_integral = 0.0f;
                 ruta_quieto = 0U;

@@ -26,6 +26,7 @@ import tkinter as tk
 import urllib.request
 from tkinter import filedialog, messagebox, simpledialog, ttk
 
+import archivos
 import tema_oscuro as T
 
 CARPETA = os.path.dirname(os.path.abspath(__file__))
@@ -682,9 +683,8 @@ class MapaGPS(tk.Frame):
 
     # ================================================================ archivo
     def cargar_ruta(self):
-        try:
-            datos = json.load(open(ARCHIVO_RUTA, encoding="utf-8"))
-        except (OSError, ValueError):
+        datos, self.ruta_mtime = archivos.cargar(ARCHIVO_RUTA)
+        if not isinstance(datos, dict):
             return
         self.x0 = tuple(datos["x0"]) if datos.get("x0") else None
         self.psi0 = datos.get("psi0")
@@ -692,10 +692,11 @@ class MapaGPS(tk.Frame):
 
     def guardar_ruta(self):
         try:
-            os.makedirs(CARPETA_MAPAS, exist_ok=True)
-            json.dump({"x0": self.x0, "psi0": self.psi0, "ruta": self.ruta,
-                       "imagen": getattr(self, "img_ruta", None)},
-                      open(ARCHIVO_RUTA, "w", encoding="utf-8"), indent=1)
+            datos = {"x0": self.x0, "psi0": self.psi0, "ruta": [list(p) for p in self.ruta],
+                     "imagen": getattr(self, "img_ruta", None)}
+            self.ruta_mtime, aviso = archivos.guardar(ARCHIVO_RUTA, datos, getattr(self, "ruta_mtime", None))
+            if aviso:
+                self.d.mensajes.append(aviso)
         except OSError:
             pass
 

@@ -34,6 +34,7 @@ import tema_oscuro as T                        # noqa: E402  (colores y componen
 import mapa_gps                                # noqa: E402  (pestana del mapa GPS)
 import calibrar_mag                            # noqa: E402  (magnetometro de canto)
 import curvas                                  # noqa: E402  (esquinas en curva)
+import archivos                                # noqa: E402  (guardado seguro de rutas)
 
 PERIODO_MS = 50                 # manejo y refresco de la ventana
 RASTRO_MAX = 3000
@@ -116,6 +117,11 @@ class Dashboard:
         self.curvas = tk.BooleanVar(master=self.root, value=True)    # esquinas en curva
         self.ruta_enviada = []                 # [(x, y, paso)] lo que se mando al carro
         self.ruta_origen = None                # "odo" o "gps": que pestana mando la ruta
+        self.puntos_gps = []                   # ruta del mapa GPS (NO se guarda encima de la grabada)
+        self.puntos_mtime = None               # mtime de ruta_odometria.json al cargar/guardar
+        self.envio_cancelar = threading.Event()   # PARAR cancela el envio de la ruta
+        self.envio_hilo = None
+        self.ruta_esperada = None              # puntos que se mandaron (se compara con el carro)
         self.idx_parada = []                   # indice en ruta_enviada de cada punto del usuario
         self.escala = 120.0                    # pixeles por metro
         self.centro = [0.0, 0.0]               # punto del mundo al centro del mapa
@@ -348,6 +354,7 @@ class Dashboard:
         threading.Thread(target=tarea, daemon=True).start()
 
     def parar_todo(self):
+        self.envio_cancelar.set()              # que no termine de mandar la ruta ni el #WG
         self.manejo.set("apagado")
         self.escribir("#M0,0")
         self.escribir("#WS")
@@ -485,12 +492,21 @@ class Dashboard:
 
     def ejecutar_ruta_odometria(self, puntos, espera_ms, reiniciar):
         """Ruta ya en metros del marco de la odometria (desde el mapa GPS)."""
-        self.puntos = list(puntos[:20])
+        if len(puntos) > 20:
+            self.mensajes.append(f"ERROR RUTA: {len(puntos)} puntos; el maximo es 20 (quita algunos)")
+            return
+        self.puntos_gps = list(puntos)         # aparte: no se guarda encima de la ruta grabada
         if reiniciar:
             with self.datos_lock:
                 self.rastro.clear()
             self.centro = [0.0, 0.0]
-        self.enviar_ruta(self.puntos, espera_ms, reiniciar, origen="gps")
+        self.enviar_ruta(self.puntos_gps, espera_ms, reiniciar, origen="gps")
+
+    def puntos_mostrados(self):
+        """Paradas que se dibujan en el mapa de odometria."""
+        if self.ruta_origen == "gps" and self.puntos_gps:
+            return self.puntos_gps
+        return self.puntos
 
     def ruta_a_enviar(self, puntos, inicio=None):
         """Paradas del usuario -> lista para el carro (con arcos si esta activado)."""
@@ -506,24 +522,42 @@ class Dashboard:
             pasos = sum(1 for p in enviados if p[2])
             self.mensajes.append(f"RUTA: {len(puntos)} paradas + {pasos} puntos de curva")
 
+        # Un solo envio a la vez: si habia otro en curso, se cancela y se espera
+        if self.envio_hilo is not None and self.envio_hilo.is_alive():
+            self.envio_cancelar.set()
+            self.envio_hilo.join(timeout=1.5)
+        cancelar = threading.Event()
+        self.envio_cancelar = cancelar
+        self.ruta_esperada = len(enviados)
+        vel = self.velocidad_ruta()            # leer Tk aqui, no desde el hilo de envio
+        for (x, y, _) in enviados:
+            if abs(x) >= 999.99 or abs(y) >= 999.99:
+                self.mensajes.append("ERROR RUTA: un punto esta a mas de 999 m del origen; no se mando")
+                return
+
+        def linea(texto, pausa):
+            if cancelar.is_set():
+                raise InterruptedError
+            self.escribir(texto)
+            time.sleep(pausa)
+
         def tarea():
-            if reiniciar:
-                self.escribir("#O")
-                time.sleep(0.1)
-            if espera_ms is not None:
-                self.escribir(f"#WE{espera_ms}")
+            try:
+                if reiniciar:
+                    linea("#O", 0.1)
+                if espera_ms is not None:
+                    linea(f"#WE{espera_ms}", 0.05)
+                linea(f"#WV{vel}", 0.05)
+                linea("#WC", 0.05)
+                for (x, y, paso) in enviados:
+                    linea(f"#W{int(round(x * 100))},{int(round(y * 100))}" + (",1" if paso else ""), 0.04)
                 time.sleep(0.05)
-            self.escribir(f"#WV{self.velocidad_ruta()}")
-            time.sleep(0.05)
-            self.escribir("#WC")
-            time.sleep(0.05)
-            for (x, y, paso) in enviados:
-                self.escribir(f"#W{int(round(x * 100))},{int(round(y * 100))}" + (",1" if paso else ""))
-                time.sleep(0.04)
-            time.sleep(0.05)
-            self.escribir("#WG")
+                linea("#WG", 0.0)
+            except InterruptedError:
+                self.mensajes.append("RUTA: envio cancelado (no se arranco)")
         self.manejo.set("apagado")             # que el manejo no le quite el control
-        threading.Thread(target=tarea, daemon=True).start()
+        self.envio_hilo = threading.Thread(target=tarea, daemon=True)
+        self.envio_hilo.start()
 
     def velocidad_ruta(self):
         try:
@@ -537,7 +571,11 @@ class Dashboard:
         if not self.puntos:
             self.mensajes.append("Agrega puntos en el mapa primero")
             return
-        self.enviar_ruta(list(self.puntos[:20]))
+        if len(self.puntos) > 20:
+            self.mensajes.append(f"ERROR RUTA: {len(self.puntos)} puntos; el maximo es 20. Quita algunos "
+                                 "(la meta debe quedar como ultimo punto)")
+            return
+        self.enviar_ruta(list(self.puntos))
 
     def grabar_punto(self):
         """Teach and repeat: agrega a la ruta el punto donde esta el carro ahora
@@ -567,6 +605,9 @@ class Dashboard:
         """Ultimo punto = la X (el origen)."""
         if self.puntos and math.hypot(*self.puntos[-1]) < 0.05:
             return
+        if len(self.puntos) >= 20:
+            self.mensajes.append("ERROR RUTA: ya hay 20 puntos; quita uno para poner la X como meta")
+            return
         self.puntos.append((0.0, 0.0))
         self.mensajes.append(f"RUTA: punto {len(self.puntos)} = la X (0, 0)")
         self.guardar_puntos()
@@ -579,9 +620,15 @@ class Dashboard:
         if not self.pose:
             self.mensajes.append("RUTA: no hay posicion del carro todavia")
             return
+        if self.pose.get("gy") is False:
+            self.mensajes.append("ERROR RUTA: el giroscopio no esta calibrado; la meta saldria mal")
+            return
         x, y = round(self.pose["x"], 3), round(self.pose["y"], 3)
         if self.puntos and math.hypot(x - self.puntos[-1][0], y - self.puntos[-1][1]) < 0.05:
             self.puntos[-1] = (x, y)           # reemplazar un "+ X" o un punto casi igual
+        elif len(self.puntos) >= 20:
+            self.mensajes.append("ERROR RUTA: ya hay 20 puntos; quita uno para poner la meta")
+            return
         else:
             self.puntos.append((x, y))
         self.mensajes.append(f"RUTA: meta = donde la odometria marco la X al grabar ({x:+.3f}, {y:+.3f}); "
@@ -593,18 +640,21 @@ class Dashboard:
 
     def guardar_puntos(self):
         try:
-            os.makedirs(os.path.dirname(self.archivo_puntos()), exist_ok=True)
-            with open(self.archivo_puntos(), "w", encoding="utf-8") as f:
-                json.dump({"puntos": self.puntos}, f)
-        except OSError:
-            pass
+            self.puntos_mtime, aviso = archivos.guardar(self.archivo_puntos(), {"puntos": self.puntos},
+                                                        self.puntos_mtime)
+            if aviso:
+                self.mensajes.append(aviso)
+        except OSError as e:
+            self.mensajes.append(f"ERROR: no se pudo guardar la ruta ({e})")
 
     def cargar_puntos(self):
+        datos, self.puntos_mtime = archivos.cargar(self.archivo_puntos())
         try:
-            with open(self.archivo_puntos(), encoding="utf-8") as f:
-                self.puntos = [tuple(p) for p in json.load(f)["puntos"]][:20]
-        except (OSError, ValueError, KeyError, TypeError):
+            self.puntos = [tuple(p) for p in datos["puntos"]]
+        except (TypeError, KeyError, ValueError):
             return
+        if len(self.puntos) > 20:
+            self.mensajes.append(f"AVISO RUTA: el archivo tiene {len(self.puntos)} puntos (maximo 20 al ejecutar)")
         if self.puntos:
             self.mensajes.append(f"RUTA: {len(self.puntos)} puntos de la sesion anterior "
                                  "(Borrar puntos para empezar otra)")
@@ -702,7 +752,10 @@ class Dashboard:
             resto += datos
             *lineas, resto = resto.split(b"\n")
             for linea in lineas:
-                self.procesar(linea.decode(errors="replace").strip())
+                try:
+                    self.procesar(linea.decode(errors="replace").strip())
+                except Exception as e:     # una linea rara no debe matar la recepcion
+                    self.mensajes.append(f"ERROR al procesar una linea del carro: {e}")
             if len(resto) > 8192:
                 resto = b""
 
@@ -754,8 +807,9 @@ class Dashboard:
             if "mg" in c:
                 try:
                     self.mag.append((t, int(c["mg"]) / 10.0, c.get("mv") == "1"))
-                    if self.cal_mag is not None and "mx" in c:
-                        self.cal_mag.append(((int(c["mx"]) / 10, int(c["my"]) / 10, int(c["mz"]) / 10),
+                    cal = self.cal_mag            # copia local: la calibracion lo pone en None
+                    if cal is not None and "mx" in c:
+                        cal.append(((int(c["mx"]) / 10, int(c["my"]) / 10, int(c["mz"]) / 10),
                                              int(c["th"]) / 10.0))
                 except ValueError:
                     pass
@@ -782,6 +836,17 @@ class Dashboard:
             self.ang_linea = texto[5:]
         elif texto.startswith(("DER:", "DIAG:", "DISTANCIA OBJETO")):
             pass
+        elif texto.startswith("RUTA: iniciada con "):
+            self.mensajes.append(texto)
+            try:
+                n = int(texto.split("con ")[1].split()[0])
+            except (IndexError, ValueError):
+                n = None
+            if self.ruta_esperada is not None and n is not None and n != self.ruta_esperada:
+                self.mensajes.append(f"ERROR RUTA: el carro recibio {n} puntos de {self.ruta_esperada}; "
+                                     "se detuvo. Vuelve a ejecutar la ruta.")
+                self.escribir("#WS")
+            self.ruta_esperada = None
         elif texto.startswith("Carro listo"):
             self.mensajes.append(texto)
             self.enviar_configuracion()
@@ -892,20 +957,21 @@ class Dashboard:
             except ValueError:
                 idx_actual = 0
         en_ruta = bool(self.pose and self.pose["md"] == "RUTA")
-        if self.puntos:
+        pts_usuario = self.puntos_mostrados()
+        if pts_usuario:
             # Desde donde esta el carro por el camino que sigue (con las curvas)
             inicio = (self.pose["x"], self.pose["y"]) if self.pose else (0.0, 0.0)
             if en_ruta and self.ruta_enviada:
                 camino = [(x, y) for (x, y, _) in self.ruta_enviada[idx_actual:]]
             else:
-                camino = [(x, y) for (x, y, _) in self.ruta_a_enviar(self.puntos, inicio)[0]]
+                camino = [(x, y) for (x, y, _) in self.ruta_a_enviar(pts_usuario, inicio)[0]]
             pts = list(self.a_pantalla(*inicio))
             for (x, y) in camino:
                 pts.extend(self.a_pantalla(x, y))
             if len(pts) >= 4:
                 c.create_line(*pts, fill=COLOR_RUTA, width=2, dash=(6, 4))
-            mapa_idx = self.idx_parada if (en_ruta and len(self.idx_parada) == len(self.puntos)) else None
-            for n, (x, y) in enumerate(self.puntos):
+            mapa_idx = self.idx_parada if (en_ruta and len(self.idx_parada) == len(pts_usuario)) else None
+            for n, (x, y) in enumerate(pts_usuario):
                 sx, sy = self.a_pantalla(x, y)
                 k = mapa_idx[n] if mapa_idx else n
                 hecho = en_ruta and k < idx_actual
