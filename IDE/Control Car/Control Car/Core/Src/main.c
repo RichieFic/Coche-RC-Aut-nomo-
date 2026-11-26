@@ -24,6 +24,13 @@
 /* PWM fijo para los motores */
 #define PWM_MAX_VALUE                49.0f
 #define PWM_MANUAL                   39.0f
+/* FRENTE_INVERTIDO = 1: la parte de atras del carro es el frente (2026-11-26,
+ * por el centro de masa). Se resuelve solo en las funciones de mas bajo nivel:
+ * el motor/encoder fisico izquierdo pasa a ser el derecho logico y viceversa,
+ * con el sentido invertido. Todo lo de arriba (odometria, rutas, angulo, WASD,
+ * Xbox, evasion) trabaja con el lado LOGICO y no cambia. El giroscopio tampoco
+ * (el giro alrededor de la vertical no depende de cual es el frente). 0 = como antes. */
+#define FRENTE_INVERTIDO             1
 #define ID_PWM_STEP                  39.0f
 #define ID_TEST_DURATION_MS          5000U
 /* Control automatico: valores iniciales para validar en el carro */
@@ -238,7 +245,7 @@ float us_ultima_cm = -1.0f;            /* ultima lectura del ultrasonico (-1 = s
 #define RUTA_PASADA_M          0.15f   /* si ya esta a menos de esto y se aleja, llego */
 /* Rumbo magnetico (IMU de canto): desfase entre el eje de referencia de la
  * placa y el frente del carro, mas la declinacion. Se ajusta en la prueba. */
-#define MAG_OFFSET_DEG         0.0f
+#define MAG_OFFSET_DEG         ((FRENTE_INVERTIDO != 0) ? 180.0f : 0.0f)
 /* Correccion de canto (ejes del MPU, uT, sobre datos crudos). No hay valores
  * por omision confiables (dependen del lugar): el rumbo magnetico es valido
  * solo despues de que el dashboard manda la calibracion con
@@ -952,58 +959,92 @@ void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
     }
 }
 #endif
+/* ---- Lado FISICO del puente H: motor A = IN1/IN2 (izquierdo de fabrica),
+ *      motor B = IN3/IN4 (derecho de fabrica). s: +1 adelante, -1 atras, 0 libre. */
+static int8_t dir_logica_izq = 0;      /* sentido LOGICO pedido a cada rueda (telemetria L:) */
+static int8_t dir_logica_der = 0;
+static void DirFisicaA(int8_t s)
+{
+    /* Motor A: adelante IN1=0 IN2=1; atras IN1=1 IN2=0. */
+    HAL_GPIO_WritePin(GPIOA, In1_Pin, (s < 0) ? GPIO_PIN_SET : GPIO_PIN_RESET);
+    HAL_GPIO_WritePin(IN2_GPIO_Port, IN2_Pin, (s > 0) ? GPIO_PIN_SET : GPIO_PIN_RESET);
+}
+static void DirFisicaB(int8_t s)
+{
+    /* Motor B: adelante IN3=1 IN4=0; atras IN3=0 IN4=1. */
+    HAL_GPIO_WritePin(GPIOA, IN3_Pin, (s > 0) ? GPIO_PIN_SET : GPIO_PIN_RESET);
+    HAL_GPIO_WritePin(GPIOA, IN4_Pin, (s < 0) ? GPIO_PIN_SET : GPIO_PIN_RESET);
+}
+/* Sentido de cada rueda LOGICA (izquierda/derecha del frente que se use). */
+static void DirLogica(int8_t izq, int8_t der)
+{
+    dir_logica_izq = izq;
+    dir_logica_der = der;
+#if (FRENTE_INVERTIDO != 0)
+    DirFisicaA((int8_t)(-der));        /* el motor A queda a la derecha y al reves */
+    DirFisicaB((int8_t)(-izq));
+#else
+    DirFisicaA(izq);
+    DirFisicaB(der);
+#endif
+}
+/* Contadores de los encoders del lado LOGICO (suben al avanzar hacia el frente).
+ * TIM3 = encoder del motor B, TIM4 = encoder del motor A. */
+static uint16_t ContadorDer(void)
+{
+#if (FRENTE_INVERTIDO != 0)
+    return (uint16_t)(0U - (uint16_t)__HAL_TIM_GET_COUNTER(&htim4));
+#else
+    return (uint16_t)__HAL_TIM_GET_COUNTER(&htim3);
+#endif
+}
+static uint16_t ContadorIzq(void)
+{
+#if (FRENTE_INVERTIDO != 0)
+    return (uint16_t)(0U - (uint16_t)__HAL_TIM_GET_COUNTER(&htim3));
+#else
+    return (uint16_t)__HAL_TIM_GET_COUNTER(&htim4);
+#endif
+}
 static void SetPWM(float pwm_left, float pwm_right)
 {
     if (pwm_left < 0.0f) pwm_left = 0.0f;
     if (pwm_left > PWM_MAX_VALUE) pwm_left = PWM_MAX_VALUE;
     if (pwm_right < 0.0f) pwm_right = 0.0f;
     if (pwm_right > PWM_MAX_VALUE) pwm_right = PWM_MAX_VALUE;
-    pwm_actual_izquierdo = pwm_left;
+    pwm_actual_izquierdo = pwm_left;   /* lado LOGICO */
     pwm_actual_derecho = pwm_right;
+#if (FRENTE_INVERTIDO != 0)
+    __HAL_TIM_SET_COMPARE(&htim5, TIM_CHANNEL_1, (uint32_t)(pwm_right + 0.5f));  /* motor A */
+    __HAL_TIM_SET_COMPARE(&htim5, TIM_CHANNEL_2, (uint32_t)(pwm_left + 0.5f));   /* motor B */
+#else
     __HAL_TIM_SET_COMPARE(&htim5, TIM_CHANNEL_1, (uint32_t)(pwm_left + 0.5f));
     __HAL_TIM_SET_COMPARE(&htim5, TIM_CHANNEL_2, (uint32_t)(pwm_right + 0.5f));
+#endif
 }
 static void SetForwardDirection(void)
 {
-    /* Motor izquierdo: IN1=0, IN2=1. */
-    HAL_GPIO_WritePin(GPIOA, In1_Pin, GPIO_PIN_RESET);
-    HAL_GPIO_WritePin(IN2_GPIO_Port, IN2_Pin, GPIO_PIN_SET);
-    /* Motor derecho: IN3=1, IN4=0. */
-    HAL_GPIO_WritePin(GPIOA, IN3_Pin, GPIO_PIN_SET);
-    HAL_GPIO_WritePin(GPIOA, IN4_Pin, GPIO_PIN_RESET);
+    DirLogica(1, 1);
     HAL_GPIO_WritePin(GPIOA, LD2_Pin, GPIO_PIN_SET);
 }
 static void SetBackwardDirection(void)
 {
-    HAL_GPIO_WritePin(GPIOA, In1_Pin, GPIO_PIN_SET);
-    HAL_GPIO_WritePin(IN2_GPIO_Port, IN2_Pin, GPIO_PIN_RESET);
-    HAL_GPIO_WritePin(GPIOA, IN3_Pin, GPIO_PIN_RESET);
-    HAL_GPIO_WritePin(GPIOA, IN4_Pin, GPIO_PIN_SET);
+    DirLogica(-1, -1);
     HAL_GPIO_WritePin(GPIOA, LD2_Pin, GPIO_PIN_RESET);
 }
 static void SetTurnLeftDirection(void)
 {
-    /* Se conserva la lógica de giro manual del programa original. */
-    HAL_GPIO_WritePin(GPIOA, In1_Pin, GPIO_PIN_SET);
-    HAL_GPIO_WritePin(IN2_GPIO_Port, IN2_Pin, GPIO_PIN_RESET);
-    HAL_GPIO_WritePin(GPIOA, IN3_Pin, GPIO_PIN_SET);
-    HAL_GPIO_WritePin(GPIOA, IN4_Pin, GPIO_PIN_RESET);
+    /* Izquierda atras, derecha adelante (gira a la izquierda sobre su eje). */
+    DirLogica(-1, 1);
 }
 static void SetTurnRightDirection(void)
 {
-    /* Se conserva la lógica de giro manual del programa original. */
-    HAL_GPIO_WritePin(GPIOA, In1_Pin, GPIO_PIN_RESET);
-    HAL_GPIO_WritePin(IN2_GPIO_Port, IN2_Pin, GPIO_PIN_SET);
-    HAL_GPIO_WritePin(GPIOA, IN3_Pin, GPIO_PIN_RESET);
-    HAL_GPIO_WritePin(GPIOA, IN4_Pin, GPIO_PIN_SET);
+    DirLogica(1, -1);
 }
 static void StopMotors(void)
 {
     SetPWM(0.0f, 0.0f);
-    HAL_GPIO_WritePin(IN2_GPIO_Port, IN2_Pin, GPIO_PIN_RESET);
-    HAL_GPIO_WritePin(GPIOA, In1_Pin, GPIO_PIN_RESET);
-    HAL_GPIO_WritePin(GPIOA, IN3_Pin, GPIO_PIN_RESET);
-    HAL_GPIO_WritePin(GPIOA, IN4_Pin, GPIO_PIN_RESET);
+    DirLogica(0, 0);
     HAL_GPIO_WritePin(GPIOA, LD2_Pin, GPIO_PIN_RESET);
 }
 /* Mueve cada rueda por separado: velocidad de -100 a 100 (negativo = atras).
@@ -1017,12 +1058,8 @@ static float PwmJoystick(int32_t v)
 }
 static void SetMotoresConSigno(int32_t izq, int32_t der)
 {
-    /* Motor izquierdo: adelante IN1=0 IN2=1; atras IN1=1 IN2=0. */
-    HAL_GPIO_WritePin(GPIOA, In1_Pin, (izq < 0) ? GPIO_PIN_SET : GPIO_PIN_RESET);
-    HAL_GPIO_WritePin(IN2_GPIO_Port, IN2_Pin, (izq > 0) ? GPIO_PIN_SET : GPIO_PIN_RESET);
-    /* Motor derecho: adelante IN3=1 IN4=0; atras IN3=0 IN4=1. */
-    HAL_GPIO_WritePin(GPIOA, IN3_Pin, (der > 0) ? GPIO_PIN_SET : GPIO_PIN_RESET);
-    HAL_GPIO_WritePin(GPIOA, IN4_Pin, (der < 0) ? GPIO_PIN_SET : GPIO_PIN_RESET);
+    DirLogica((int8_t)((izq > 0) ? 1 : ((izq < 0) ? -1 : 0)),
+              (int8_t)((der > 0) ? 1 : ((der < 0) ? -1 : 0)));
     SetPWM(PwmJoystick(izq), PwmJoystick(der));
 }
 /* Angulo, velocidad y disponibilidad de la fuente elegida para los giros. */
@@ -1063,8 +1100,8 @@ static void PrepararControlGiro(void)
     giro_boost = 0.0f;
     giro_lento_desde_ms = ahora;
     giro_boost_ms = ahora;
-    giro_enc_ini3 = (uint16_t)__HAL_TIM_GET_COUNTER(&htim3);
-    giro_enc_ini4 = (uint16_t)__HAL_TIM_GET_COUNTER(&htim4);
+    giro_enc_ini3 = ContadorDer();
+    giro_enc_ini4 = ContadorIzq();
     giro_enc_valido = GIRO_EQUILIBRAR_ENC;
 }
 /* PWM de cada rueda durante el giro: perfil + antiatasco + equilibrio. */
@@ -1099,8 +1136,8 @@ static void PwmGiroControlado(float progreso_deg, float vel_dps)
     /* Pivote centrado: que las dos ruedas avancen lo mismo. */
     if (giro_enc_valido != 0U)
     {
-        int32_t d_der = abs((int)(int16_t)((uint16_t)__HAL_TIM_GET_COUNTER(&htim3) - giro_enc_ini3));
-        int32_t d_izq = abs((int)(int16_t)((uint16_t)__HAL_TIM_GET_COUNTER(&htim4) - giro_enc_ini4));
+        int32_t d_der = abs((int)(int16_t)(ContadorDer() - giro_enc_ini3));
+        int32_t d_izq = abs((int)(int16_t)(ContadorIzq() - giro_enc_ini4));
         int32_t mayor = (d_der > d_izq) ? d_der : d_izq;
         int32_t menor = (d_der > d_izq) ? d_izq : d_der;
         if ((mayor > 150) && ((menor * 10) < (mayor * 3)))
@@ -1391,8 +1428,8 @@ static void OdometriaPaso(void)
 
     if (odo_iniciada == 0U)
     {
-        odo_prev3 = (uint16_t)__HAL_TIM_GET_COUNTER(&htim3);
-        odo_prev4 = (uint16_t)__HAL_TIM_GET_COUNTER(&htim4);
+        odo_prev3 = ContadorDer();
+        odo_prev4 = ContadorIzq();
         odo_theta0_deg = YawFuenteDeg();
         odo_ultimo_ms = ahora;
         odo_iniciada = 1U;
@@ -1402,8 +1439,8 @@ static void OdometriaPaso(void)
     dt = (float)(ahora - odo_ultimo_ms) / 1000.0f;
     odo_ultimo_ms = ahora;
 
-    c3 = (uint16_t)__HAL_TIM_GET_COUNTER(&htim3);
-    c4 = (uint16_t)__HAL_TIM_GET_COUNTER(&htim4);
+    c3 = ContadorDer();
+    c4 = ContadorIzq();
     d3 = (int16_t)(c3 - odo_prev3);
     d4 = (int16_t)(c4 - odo_prev4);
     odo_prev3 = c3;
@@ -1468,10 +1505,8 @@ static void OdometriaPaso(void)
         int k;
         uint8_t ck = 0U;
         /* Sentido de cada rueda segun los pines del puente H. */
-        int32_t s_izq = (HAL_GPIO_ReadPin(IN2_GPIO_Port, IN2_Pin) == GPIO_PIN_SET) ? 1 :
-                        ((HAL_GPIO_ReadPin(GPIOA, In1_Pin) == GPIO_PIN_SET) ? -1 : 0);
-        int32_t s_der = (HAL_GPIO_ReadPin(GPIOA, IN3_Pin) == GPIO_PIN_SET) ? 1 :
-                        ((HAL_GPIO_ReadPin(GPIOA, IN4_Pin) == GPIO_PIN_SET) ? -1 : 0);
+        int32_t s_izq = dir_logica_izq;  /* sentido logico (ya contempla FRENTE_INVERTIDO) */
+        int32_t s_der = dir_logica_der;
         log_seq++;
         n = snprintf(l, sizeof(l), "L:%u,%lu,%u,%u,%ld,%ld,%ld,%ld,%ld,%c,%u,%u,%ld,%ld,%ld",
                      (unsigned int)log_seq, (unsigned long)ahora, (unsigned int)c3, (unsigned int)c4,
@@ -1840,8 +1875,8 @@ static void IniciarTramoEvasion(uint8_t fase)
  * Adelante ambos encoders suben; giro derecha: izq +, der - -> yaw baja. */
 static void ActualizarYawEncoders(void)
 {
-    uint16_t c3 = (uint16_t)__HAL_TIM_GET_COUNTER(&htim3);   /* derecho */
-    uint16_t c4 = (uint16_t)__HAL_TIM_GET_COUNTER(&htim4);   /* izquierdo */
+    uint16_t c3 = ContadorDer();   /* derecho */
+    uint16_t c4 = ContadorIzq();   /* izquierdo */
     int16_t d_der = (int16_t)(c3 - enc_yaw_prev3);
     int16_t d_izq = (int16_t)(c4 - enc_yaw_prev4);
     uint32_t ahora = HAL_GetTick();
@@ -2838,8 +2873,8 @@ int main(void)
             uint16_t encoder3_current;
             uint16_t encoder4_current;
             float dt;
-            encoder3_current = (uint16_t)__HAL_TIM_GET_COUNTER(&htim3);
-            encoder4_current = (uint16_t)__HAL_TIM_GET_COUNTER(&htim4);
+            encoder3_current = ContadorDer();
+            encoder4_current = ContadorIzq();
             /* Diferencia de cuentas desde la medicion anterior */
             encoder3_delta = (int16_t)(encoder3_current - encoder3_previous);
             encoder4_delta = (int16_t)(encoder4_current - encoder4_previous);
