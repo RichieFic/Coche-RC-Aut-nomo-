@@ -84,29 +84,40 @@ def delta16(a, b):
     return d - 0x10000 if d >= 0x8000 else d
 
 
-# Detector de huecos del encoder (igual que ODO_HUECO_* en main.c): si una rueda
-# cuenta casi cero mientras la otra cuenta normal y el giroscopio NO ve que el
-# carro gire, el encoder se salto cuentas: se usa la rueda buena para las dos.
-HUECO_MIN_CUENTAS = 30         # la rueda buena debe contar mas que esto en el paso (20 ms)
-HUECO_FRACCION = 0.5           # la mala cuenta a lo mas esta fraccion de la buena
-HUECO_GIRO_MAX_DPS = 30.0      # el carro casi no gira segun el giroscopio...
-HUECO_GIRO_VECES = 3.0         # ...y las ruedas "dicen" que giro mas de 3x lo que mide el giroscopio
+# Detector de huecos del encoder por consistencia con el giroscopio (igual que
+# ODO_HUECO_* en main.c). Con el giro medido en el paso se sabe cuanta diferencia
+# de cuentas DEBERIA haber entre las ruedas: esperado = dtheta * B_ef / m. Si la
+# diferencia medida se aleja mucho de eso, la rueda con MENOS cuentas se salto
+# cuentas (un encoder que falla solo puede perder, nunca sumar) y se reconstruye
+# desde la otra rueda y el giroscopio. B_ef es la via "efectiva" del carro de 4
+# ruedas al avanzar (las ruedas patinan al girar: gyro/ruedas ~0.65 -> 0.172/0.65).
+HUECO_B_EF_M = 0.26            # via efectiva al avanzar (m)
+HUECO_MIN_CUENTAS = 15         # la rueda buena debe contar mas que esto en el paso (20 ms)
+HUECO_TOL_CUENTAS = 10         # tolerancia fija...
+HUECO_TOL_FRACCION = 0.5       # ...mas esta fraccion de la diferencia esperada
+HUECO_GIRO_MAX_DPS = 15.0      # solo casi en linea recta: en curvas el patinaje varia y daria falsos huecos
 PASO_S = 0.020                 # periodo de la odometria (ODO_PERIODO_MS)
 
 
-def corregir_hueco(d3, d4, rate_dps, m_por_cuenta=M_POR_CUENTA, via_m=TRACK_WIDTH_M, dt=PASO_S):
-    """Regresa (d3, d4, hubo_hueco) con la rueda que se salto cuentas corregida."""
-    if abs(rate_dps) >= HUECO_GIRO_MAX_DPS:
+def corregir_hueco(d3, d4, dyaw_deg, m_por_cuenta=M_POR_CUENTA, dt=PASO_S, b_ef=None):
+    """d3 = rueda derecha, d4 = izquierda (cuentas del paso), dyaw_deg = giro del
+    giroscopio en el paso (izq +). Regresa (d3, d4, hubo_hueco)."""
+    b_ef = HUECO_B_EF_M if b_ef is None else b_ef
+    if dt <= 0 or abs(dyaw_deg) / dt >= HUECO_GIRO_MAX_DPS:
         return d3, d4, False
-    if dt <= 0:
+    if max(abs(d3), abs(d4)) <= HUECO_MIN_CUENTAS:
         return d3, d4, False
-    w_ruedas = math.degrees((d3 - d4) * m_por_cuenta / via_m / dt)
-    if abs(w_ruedas) <= HUECO_GIRO_VECES * abs(rate_dps) + 15.0:
-        return d3, d4, False           # la diferencia entre ruedas la confirma el giroscopio
-    if abs(d3) > HUECO_MIN_CUENTAS and abs(d4) <= HUECO_FRACCION * abs(d3):
-        return d3, d3, True
-    if abs(d4) > HUECO_MIN_CUENTAS and abs(d3) <= HUECO_FRACCION * abs(d4):
-        return d4, d4, True
+    esperado = math.radians(dyaw_deg) * b_ef / m_por_cuenta      # (der - izq) esperado
+    if abs((d3 - d4) - esperado) <= HUECO_TOL_CUENTAS + HUECO_TOL_FRACCION * abs(esperado):
+        return d3, d4, False
+    if abs(d3) >= abs(d4):
+        nuevo = d3 - esperado                                      # izquierda reconstruida
+        if abs(nuevo) > abs(d4):
+            return d3, int(round(nuevo)), True
+    else:
+        nuevo = d4 + esperado                                      # derecha reconstruida
+        if abs(nuevo) > abs(d3):
+            return int(round(nuevo)), d4, True
     return d3, d4, False
 
 
@@ -139,7 +150,7 @@ def replay(tramas, escala_der=ODO_ESCALA, escala_izq=ODO_ESCALA, m_por_cuenta=M_
             th0 = yaw_gyro - tr["th_cdeg"] / 100.0
             yaw_enc = 0.0
         if detector:
-            d3, d4, hubo = corregir_hueco(d3, d4, tr["rate_cdps"] / 100.0,
+            d3, d4, hubo = corregir_hueco(d3, d4, (tr["yaw_mdeg"] - anterior["yaw_mdeg"]) / 1000.0,
                                           dt=(tr["t_ms"] - anterior["t_ms"]) / 1000.0)
             if hubo and contar is not None:
                 contar[0] += 1

@@ -20,7 +20,8 @@ de giro y al salir pivotaba ~57). El ultimo punto (la meta) no se redondea.
 
 import math
 
-RADIO_M = 0.5            # radio aproximado del arco
+RADIO_M = 0.8            # radio aproximado del arco (con 0.5 la direccion se saturaba
+                         # el 38 % del tiempo en curva y el carro se abria)
 GIRO_MIN_DEG = 20.0      # esquinas mas suaves que esto se dejan igual
 GIRO_MAX_DEG = 100.0     # esquinas mas cerradas (vueltas en U) no se redondean: el arco
                          # quedaria lejos del punto; ahi el carro para y pivota

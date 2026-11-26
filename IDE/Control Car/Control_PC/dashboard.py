@@ -201,6 +201,7 @@ class Dashboard:
         ttk.Button(botones, text="Borrar puntos", command=self.borrar_puntos).pack(side="left", padx=3)
         ttk.Button(botones, text="● Grabar punto (P / LB)", style="Accion.TButton",
                    command=self.grabar_punto).pack(side="left", padx=3)
+        ttk.Button(botones, text="✓ Terminé en la X", command=self.termine_en_x).pack(side="left", padx=3)
         ttk.Button(botones, text="+ X", width=4, command=self.cerrar_en_x).pack(side="left", padx=3)
         ttk.Button(botones, text="Reiniciar origen", command=self.reiniciar_origen).pack(side="left", padx=3)
         ttk.Checkbutton(botones, text="Seguir al carro", variable=self.seguir,
@@ -540,6 +541,23 @@ class Dashboard:
             return
         self.puntos.append((0.0, 0.0))
         self.mensajes.append(f"RUTA: punto {len(self.puntos)} = la X (0, 0)")
+        self.guardar_puntos()
+
+    def termine_en_x(self):
+        """Al grabar: el carro ya regreso FISICAMENTE a la X (manejado, sin cargarlo).
+        La meta se pone donde la odometria cree que esta ahora, no en (0, 0): asi los
+        errores que se repiten igual al grabar y al repetir (escala del giroscopio y de
+        los encoders) se cancelan (principio de teach and repeat)."""
+        if not self.pose:
+            self.mensajes.append("RUTA: no hay posicion del carro todavia")
+            return
+        x, y = round(self.pose["x"], 3), round(self.pose["y"], 3)
+        if self.puntos and math.hypot(x - self.puntos[-1][0], y - self.puntos[-1][1]) < 0.05:
+            self.puntos[-1] = (x, y)           # reemplazar un "+ X" o un punto casi igual
+        else:
+            self.puntos.append((x, y))
+        self.mensajes.append(f"RUTA: meta = donde la odometria marco la X al grabar ({x:+.3f}, {y:+.3f}); "
+                             f"a {math.hypot(x, y) * 100:.0f} cm de (0, 0)")
         self.guardar_puntos()
 
     def archivo_puntos(self):

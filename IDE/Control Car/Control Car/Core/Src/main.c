@@ -191,10 +191,11 @@ uint16_t log_seq = 0U;
 uint8_t odo_reinicios = 0U;            /* cuantas veces se reinicio la odometria (#O) */
 /* Huecos del encoder (2026-11-25: el izquierdo perdio ~12 % de cuentas en una
  * vuelta de 127 m y el carro cerro a 1.4 m creyendo 0.04 m). */
-#define ODO_HUECO_MIN_CUENTAS  30      /* la rueda buena cuenta mas que esto en el paso */
-#define ODO_HUECO_FRACCION     0.5f    /* la mala cuenta a lo mas esta fraccion */
-#define ODO_HUECO_GIRO_MAX_DPS 30.0f   /* el giroscopio casi no ve giro... */
-#define ODO_HUECO_GIRO_VECES   3.0f    /* ...y las ruedas dicen que giro > 3x eso + 15 dps */
+#define ODO_HUECO_B_EF_M       0.26f   /* via efectiva al avanzar (las ruedas patinan al girar) */
+#define ODO_HUECO_MIN_CUENTAS  15      /* la rueda buena cuenta mas que esto en el paso */
+#define ODO_HUECO_TOL_CUENTAS  10.0f   /* tolerancia fija... */
+#define ODO_HUECO_TOL_FRACCION 0.5f    /* ...mas esta fraccion de la diferencia esperada */
+#define ODO_HUECO_GIRO_MAX_DPS 15.0f   /* solo casi en linea recta */
 uint32_t odo_huecos = 0U;              /* pasos corregidos (se manda como ef= en P:) */
 volatile uint8_t log_rx = 0xFFU;       /* 0/1 recibido por la interrupcion */
 volatile uint8_t odo_rx_reset = 0U;
@@ -221,7 +222,12 @@ float us_ultima_cm = -1.0f;            /* ultima lectura del ultrasonico (-1 = s
 #define RUTA_CORR_MAX_LINEA    35.0f   /* correccion maxima entre ruedas (%) */
 #define RUTA_OBSTACULO_CM      20.0f   /* se pausa si hay algo a esta distancia o menos */
 #define RUTA_ESPERA_MS_DEF     5000U   /* espera en cada waypoint (#WE<ms> la cambia) */
-#define RUTA_LLEGADA_FINAL_M   0.05f   /* el ultimo punto (la meta) se exige mas fino */
+#define RUTA_LLEGADA_FINAL_M   0.05f   /* paradas intermedias */
+#define RUTA_LLEGADA_META_M    0.015f  /* la meta: al poner PWM 0 el carro rueda ~1-2 cm mas
+                                          (con 5 cm se quedaba ~4 cm antes de la X) */
+#define RUTA_AVANCE_CURVA      55      /* % maximo en las curvas (a 80 % se satura la direccion) */
+#define RUTA_SEG_CURVA_M       0.6f    /* tramo mas corto que esto = parte de un arco */
+#define RUTA_ANTES_CURVA_M     0.4f    /* bajar la velocidad desde esta distancia antes del arco */
 #define RUTA_FRENADO_FINAL_M   0.80f   /* ...y se llega frenando desde mas lejos */
 #define RUTA_PASADA_M          0.15f   /* si ya esta a menos de esto y se aleja, llego */
 /* Rumbo magnetico (IMU de canto): desfase entre el eje de referencia de la
@@ -1394,33 +1400,48 @@ static void OdometriaPaso(void)
     odo_prev3 = c3;
     odo_prev4 = c4;
 
-    /* Detector de huecos del encoder: si una rueda cuenta casi cero mientras la
-     * otra cuenta normal y el giroscopio NO ve que el carro gire, ese encoder se
-     * salto cuentas (cable/ruido): se usa la rueda buena para las dos. */
+    th_nuevo = YawFuenteDeg() - odo_theta0_deg;
+    /* Detector de huecos del encoder por consistencia con el giroscopio: con el
+     * giro medido en el paso se sabe cuanta diferencia de cuentas deberia haber
+     * entre las ruedas (dtheta * B_ef / m). Si la medida se aleja mucho, la rueda
+     * con MENOS cuentas se salto cuentas (un encoder que falla solo pierde) y se
+     * reconstruye desde la otra rueda y el giroscopio. Solo casi en linea recta:
+     * en curvas el patinaje del carro de 4 ruedas varia y daria falsos huecos. */
     if ((gyro_ok != 0U) && (giro_fuente == GIRO_FUENTE_GYRO) && (dt > 0.0f))
     {
-        float w_gyro = fabsf(RateFuenteDps());
-        float w_ruedas = fabsf(((float)(d3 - d4)) * distance_per_count / TRACK_WIDTH_M / dt) * 57.2957795f;
-        if ((w_gyro < ODO_HUECO_GIRO_MAX_DPS) &&
-            (w_ruedas > ((ODO_HUECO_GIRO_VECES * w_gyro) + 15.0f)))
+        float dth = th_nuevo - odo_theta_deg;                  /* grados en el paso, izq + */
+        int16_t a3 = (d3 < 0) ? (int16_t)(-d3) : d3;
+        int16_t a4 = (d4 < 0) ? (int16_t)(-d4) : d4;
+        if ((fabsf(dth) / dt < ODO_HUECO_GIRO_MAX_DPS) &&
+            (((a3 > a4) ? a3 : a4) > ODO_HUECO_MIN_CUENTAS))
         {
-            int16_t a3 = (d3 < 0) ? (int16_t)(-d3) : d3;
-            int16_t a4 = (d4 < 0) ? (int16_t)(-d4) : d4;
-            if ((a3 > ODO_HUECO_MIN_CUENTAS) && ((float)a4 <= (ODO_HUECO_FRACCION * (float)a3)))
+            float esperado = (dth / 57.2957795f) * ODO_HUECO_B_EF_M / distance_per_count;  /* der - izq */
+            float error = ((float)(d3 - d4)) - esperado;
+            if (fabsf(error) > (ODO_HUECO_TOL_CUENTAS + (ODO_HUECO_TOL_FRACCION * fabsf(esperado))))
             {
-                d4 = d3;
-                odo_huecos++;
-            }
-            else if ((a4 > ODO_HUECO_MIN_CUENTAS) && ((float)a3 <= (ODO_HUECO_FRACCION * (float)a4)))
-            {
-                d3 = d4;
-                odo_huecos++;
+                if (a3 >= a4)
+                {
+                    float nuevo = (float)d3 - esperado;            /* izquierda reconstruida */
+                    if (fabsf(nuevo) > (float)a4)
+                    {
+                        d4 = (int16_t)lroundf(nuevo);
+                        odo_huecos++;
+                    }
+                }
+                else
+                {
+                    float nuevo = (float)d4 + esperado;            /* derecha reconstruida */
+                    if (fabsf(nuevo) > (float)a3)
+                    {
+                        d3 = (int16_t)lroundf(nuevo);
+                        odo_huecos++;
+                    }
+                }
             }
         }
     }
     /* Adelante ambos encoders suben: el promedio con signo es el avance. */
     ds = (((float)d3 * ODO_ESCALA_DER) + ((float)d4 * ODO_ESCALA_IZQ)) * 0.5f * distance_per_count;
-    th_nuevo = YawFuenteDeg() - odo_theta0_deg;
     th_medio = ((odo_theta_deg + th_nuevo) * 0.5f) / 57.2957795f;
     odo_x_m += ds * cosf(th_medio);
     odo_y_m += ds * sinf(th_medio);
@@ -1576,7 +1597,7 @@ static void RutaPaso(void)
 
     /* Todas las paradas a 5 cm (antes 10 en las intermedias): en las curvas, parar
      * 10 cm antes deja al carro fuera del arco y tendria que pivotar. */
-    if ((dist < RUTA_LLEGADA_FINAL_M) || (ruta_alejando >= 3U))
+    if ((dist < ((es_meta != 0U) ? RUTA_LLEGADA_META_M : RUTA_LLEGADA_FINAL_M)) || (ruta_alejando >= 3U))
     {
         char m[80];
         ruta_ax = (float)ruta_x_cm[ruta_idx] / 100.0f;
@@ -1732,6 +1753,21 @@ static void RutaPaso(void)
             int32_t fr = RUTA_AVANCE_MIN +
                          (int32_t)((float)(ruta_avance - RUTA_AVANCE_MIN) * dist_parada / frenado);
             if (fr < avance) avance = fr;
+        }
+        /* En las curvas (tramos cortos de los arcos, o a punto de entrar a uno)
+         * ir mas lento: a 80 % la direccion se satura y el carro se abre. */
+        {
+            uint8_t en_curva = 0U;
+            float sx = ((float)ruta_x_cm[ruta_idx] / 100.0f) - ruta_ax;
+            float sy = ((float)ruta_y_cm[ruta_idx] / 100.0f) - ruta_ay;
+            if (sqrtf((sx * sx) + (sy * sy)) < RUTA_SEG_CURVA_M) en_curva = 1U;
+            if ((ruta_paso[ruta_idx] != 0U) && ((ruta_idx + 1U) < ruta_n) && (dist < RUTA_ANTES_CURVA_M))
+            {
+                float nx = (float)(ruta_x_cm[ruta_idx + 1U] - ruta_x_cm[ruta_idx]) / 100.0f;
+                float ny = (float)(ruta_y_cm[ruta_idx + 1U] - ruta_y_cm[ruta_idx]) / 100.0f;
+                if (sqrtf((nx * nx) + (ny * ny)) < RUTA_SEG_CURVA_M) en_curva = 1U;
+            }
+            if ((en_curva != 0U) && (avance > RUTA_AVANCE_CURVA)) avance = RUTA_AVANCE_CURVA;
         }
         if (c > RUTA_CORR_MAX_LINEA) c = RUTA_CORR_MAX_LINEA;
         if (c < -RUTA_CORR_MAX_LINEA) c = -RUTA_CORR_MAX_LINEA;
