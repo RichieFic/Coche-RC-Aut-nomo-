@@ -35,8 +35,11 @@ import mapa_gps                                # noqa: E402  (pestana del mapa G
 import calibrar_mag                            # noqa: E402  (magnetometro de canto)
 import curvas                                  # noqa: E402  (esquinas en curva)
 import archivos                                # noqa: E402  (guardado seguro de rutas)
+import prueba_encoders                         # noqa: E402  (prueba con las ruedas en el aire)
 
 PERIODO_MS = 50                 # manejo y refresco de la ventana
+PRUEBA_ENC_S = 20.0             # duracion de la prueba de encoders
+PRUEBA_ENC_PWM = 60             # % para las dos ruedas en la prueba
 RASTRO_MAX = 3000
 PATRON_CAMPOS = re.compile(r"(\w+)=([^\s|]+)")
 COLOR_MAPA = "#081120"
@@ -121,6 +124,7 @@ class Dashboard:
         self.puntos_mtime = None               # mtime de ruta_odometria.json al cargar/guardar
         self.envio_cancelar = threading.Event()   # PARAR cancela el envio de la ruta
         self.envio_hilo = None
+        self.prueba_enc = None                 # prueba de encoders en curso: {"fin": t, "tramas": [...]}
         self.ruta_esperada = None              # puntos que se mandaron (se compara con el carro)
         self.idx_parada = []                   # indice en ruta_enviada de cada punto del usuario
         self.escala = 120.0                    # pixeles por metro
@@ -169,6 +173,7 @@ class Dashboard:
         self.btn_asist = ttk.Button(barra, text="Asistencia de rumbo: ON",
                                     command=self.alternar_asistencia)
         self.btn_asist.pack(side="left", padx=12)
+        ttk.Button(barra, text="Probar encoders", command=self.probar_encoders).pack(side="left")
         ttk.Label(barra, text="Esc = parar   ·   Q = parar   ·   H = asistencia",
                   style="Fondo.TLabel").pack(side="right")
 
@@ -711,8 +716,45 @@ class Dashboard:
         self.teclas.discard(ev.keysym.lower())
 
     # ================================================================ ciclo
+    def probar_encoders(self):
+        """Ruedas en el aire: las dos giran igual 20 s y se buscan huecos en cada encoder."""
+        if self.prueba_enc is not None:
+            return
+        if not messagebox.askyesno(
+                "Probar encoders",
+                "Levanta el carro para que las ruedas queden EN EL AIRE (sin tocar nada).\n\n"
+                "Las dos ruedas van a girar 20 segundos. Mientras gira puedes mover un poco el\n"
+                "cable del encoder sospechoso: si se pierden cuentas, la prueba lo detecta.\n\n"
+                "¿Empezar?", parent=self.root):
+            return
+        self.envio_cancelar.set()
+        self.manejo.set("apagado")
+        self.escribir("#WS")
+        self.escribir("#CX")
+        self.escribir("#L1")
+        self.prueba_enc = {"fin": time.monotonic() + PRUEBA_ENC_S, "tramas": []}
+        self.mensajes.append(f"PRUEBA ENCODERS: girando {PRUEBA_ENC_S:.0f} s con las ruedas en el aire...")
+
+    def paso_prueba_encoders(self):
+        p = self.prueba_enc
+        if time.monotonic() < p["fin"]:
+            self.escribir(f"#M{PRUEBA_ENC_PWM},{PRUEBA_ENC_PWM}")
+            return
+        self.escribir("#M0,0")
+        self.prueba_enc = None
+        try:
+            texto, _ = prueba_encoders.analizar(p["tramas"])
+        except Exception as e:             # nunca dejar el ciclo sin reprogramar
+            texto = f"ERROR PRUEBA ENCODERS: {e}"
+        self.mensajes.append(texto)
+
     def ciclo(self):
         if not self.vivo:
+            return
+        if self.prueba_enc is not None:
+            self.paso_prueba_encoders()
+            self.refrescar()
+            self.root.after(PERIODO_MS, self.ciclo)
             return
         modo = self.manejo.get()
         if modo == "teclado":
@@ -779,6 +821,13 @@ class Dashboard:
                 self.log_perdidas += salto - 1
         self.log_seq = seq
         self.log_tramas += 1
+        p = self.prueba_enc
+        if p is not None:
+            v = cuerpo.split(",")
+            try:
+                p["tramas"].append((int(v[1]), int(v[2]), int(v[3])))
+            except (IndexError, ValueError):
+                pass
 
     def procesar(self, texto):
         if not texto:
