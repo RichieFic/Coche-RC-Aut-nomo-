@@ -86,9 +86,13 @@ def odo_a_enu(x, y, psi0):
 
 
 def es_zoom(ev):
-    """Rueda del mouse (pasos de 120) o Ctrl / pellizco = zoom; dos dedos en el
-    trackpad (pasos chicos) = mover el mapa."""
-    return bool(ev.state & 0x0004) or (ev.delta != 0 and ev.delta % 120 == 0)
+    """Solo Ctrl + rueda o pellizcar en el trackpad (Windows lo manda como Ctrl +
+    rueda) hacen zoom. La rueda y los dos dedos mueven el mapa: hay trackpads que
+    mandan los mismos pasos que un mouse y no se pueden distinguir."""
+    return bool(ev.state & 0x0004)
+
+
+PASO_RUEDA = 0.6         # pixeles que se mueve el mapa por cada unidad de la rueda
 
 
 def leer_lat_lon(texto):
@@ -196,6 +200,8 @@ class MapaGPS(tk.Frame):
         ttk.Button(b2, text="Descargar zona", command=self.descargar).pack(side="left", padx=3)
         ttk.Button(b2, text="Centrar en GPS", command=self.centrar_gps).pack(side="left", padx=3)
         ttk.Button(b2, text="Ajustar a la ruta", command=self.ajustar_vista).pack(side="left", padx=3)
+        ttk.Button(b2, text="+", width=3, command=lambda: self.zoom_paso(True)).pack(side="left", padx=(3, 0))
+        ttk.Button(b2, text="−", width=3, command=lambda: self.zoom_paso(False)).pack(side="left")
         ttk.Checkbutton(b2, text="Seguir carro", variable=self.seguir,
                         style="Panel.TCheckbutton").pack(side="left", padx=6)
 
@@ -446,7 +452,7 @@ class MapaGPS(tk.Frame):
 
     # ================================================================ interaccion
     TEXTO_ACCION = {
-        "ruta": "Clic: agregar punto del recorrido · clic derecho: quitar el último · arrastrar: mover · rueda: zoom",
+        "ruta": "Clic: agregar punto · clic derecho: quitar el último · arrastrar / dos dedos: mover · pellizco, Ctrl+rueda o + −: zoom",
         "x": "Haz clic EXACTAMENTE en la X (salida y meta)",
         "dir": "Haz clic en un punto hacia donde apunta el frente del carro en la X",
         "cal1": "Calibrar: clic en un punto fácil de reconocer (esquina de un edificio) · arrastrar: mover · rueda: zoom",
@@ -526,11 +532,26 @@ class MapaGPS(tk.Frame):
 
     def rueda_h(self, ev):
         """Desplazamiento horizontal (dos dedos de lado en el trackpad / Shift + rueda)."""
-        self.desplazar(ev.delta, 0)
+        self.desplazar(ev.delta * PASO_RUEDA, 0)
+
+    def zoom_paso(self, arriba, x=None, y=None):
+        """Un paso de zoom (botones + / -, Ctrl + rueda o pellizco)."""
+        if self.img_sin_calibrar():
+            w, h = self.tam()
+            x = w / 2 if x is None else x
+            y = h / 2 if y is None else y
+            px, py = self.pantalla_a_img(x, y)
+            self.img_nivel = max(-3, min(3, self.img_nivel + (1 if arriba else -1)))
+            f = self.factor_img()
+            self.img_vista = [x - px * f, y - py * f]
+        elif self.modo_fondo.get() == "img" and self.img_cal:
+            self.img_nivel = max(-3, min(3, self.img_nivel + (1 if arriba else -1)))
+        else:
+            self.z = max(14.0, min(22.0, self.z + (1 if arriba else -1)))
 
     def rueda(self, ev):
         if not es_zoom(ev):
-            self.desplazar(0, ev.delta)        # dos dedos en el trackpad: mover
+            self.desplazar(0, ev.delta * PASO_RUEDA)   # rueda / dos dedos: mover
             return
         # zoom en pasos enteros; el pellizco manda poquito a la vez: se acumula
         self.rueda_acum = getattr(self, "rueda_acum", 0) + ev.delta
@@ -538,17 +559,7 @@ class MapaGPS(tk.Frame):
             return
         arriba = self.rueda_acum > 0
         self.rueda_acum = 0
-        if self.img_sin_calibrar():
-            # zoom alrededor del cursor
-            px, py = self.pantalla_a_img(ev.x, ev.y)
-            self.img_nivel = max(-3, min(3, self.img_nivel + (1 if arriba else -1)))
-            f = self.factor_img()
-            self.img_vista = [ev.x - px * f, ev.y - py * f]
-            return
-        if self.modo_fondo.get() == "img" and self.img_cal:
-            self.img_nivel = max(-3, min(3, self.img_nivel + (1 if arriba else -1)))
-        else:
-            self.z = max(14.0, min(22.0, self.z + (1 if arriba else -1)))
+        self.zoom_paso(arriba, ev.x, ev.y)
 
     def quitar_punto(self):
         if self.ruta:

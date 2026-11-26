@@ -206,6 +206,8 @@ class Dashboard:
         ttk.Button(botones, text="Reiniciar origen", command=self.reiniciar_origen).pack(side="left", padx=3)
         ttk.Checkbutton(botones, text="Seguir al carro", variable=self.seguir,
                         style="Panel.TCheckbutton").pack(side="left", padx=8)
+        ttk.Button(botones, text="+", width=3, command=lambda: self.zoom_mapa(1.25)).pack(side="left", padx=(3, 0))
+        ttk.Button(botones, text="−", width=3, command=lambda: self.zoom_mapa(0.8)).pack(side="left")
         ttk.Checkbutton(botones, text="Esquinas en curva", variable=self.curvas,
                         style="Panel.TCheckbutton").pack(side="left", padx=(6, 0))
         ttk.Label(botones, text="Vel (%)").pack(side="left", padx=(6, 2))
@@ -222,7 +224,8 @@ class Dashboard:
         self.mapa.bind("<ButtonPress-2>", self.presion_medio_mapa)
         self.mapa.bind("<B2-Motion>", self.mover_medio_mapa)
         tk.Label(izq, text="Clic izquierdo: agregar punto · clic derecho: quitar el último · "
-                           "rueda: zoom.  El carro arranca en (0, 0) mirando hacia arriba.",
+                           "dos dedos / rueda: mover · pellizco, Ctrl+rueda o + −: zoom.  "
+                           "El carro arranca en (0, 0) mirando hacia arriba.",
                  bg=T.PANEL, fg=T.TEXTO_TENUE, font=T.FUENTE_UI).pack(anchor="w", padx=8, pady=(0, 6))
 
         # ---------------- Derecha: sistemas, graficas, control de angulo, mensajes
@@ -791,13 +794,16 @@ class Dashboard:
 
     def rueda_mapa(self, ev):
         if not mapa_gps.es_zoom(ev):
-            self.desplazar_mapa(0, ev.delta)   # dos dedos en el trackpad: mover
+            self.desplazar_mapa(0, ev.delta * mapa_gps.PASO_RUEDA)   # rueda / dos dedos: mover
             return
-        factor = 1.15 ** (ev.delta / 120.0)    # rueda: un paso; pellizco: poquito
+        factor = 1.15 ** (ev.delta / 120.0)    # Ctrl + rueda: un paso; pellizco: poquito
+        self.escala = min(800.0, max(20.0, self.escala * factor))
+
+    def zoom_mapa(self, factor):
         self.escala = min(800.0, max(20.0, self.escala * factor))
 
     def rueda_mapa_h(self, ev):
-        self.desplazar_mapa(ev.delta, 0)
+        self.desplazar_mapa(ev.delta * mapa_gps.PASO_RUEDA, 0)
 
     def presion_medio_mapa(self, ev):
         self.arrastre_medio = (ev.x, ev.y)
