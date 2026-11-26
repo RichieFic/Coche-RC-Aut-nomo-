@@ -166,9 +166,19 @@ class Dashboard:
         ttk.Label(barra, text="Esc = parar   ·   Q = parar   ·   H = asistencia",
                   style="Fondo.TLabel").pack(side="right")
 
+        # ---------------- Aviso grande: giroscopio sin calibrar (se muestra solo si hace falta)
+        self.banner_gyro = tk.Frame(r, bg=T.ROJO)
+        tk.Label(self.banner_gyro, text="⚠  GIROSCOPIO SIN CALIBRAR: la ruta no arranca y los puntos "
+                                       "grabados salen mal. Deja el carro QUIETO y recalibra.",
+                 bg=T.ROJO, fg="#ffffff", font=("Segoe UI", 11, "bold")).pack(side="left", padx=10, pady=4)
+        ttk.Button(self.banner_gyro, text="Recalibrar giroscopio",
+                   command=self.recalibrar_giroscopio).pack(side="right", padx=10, pady=3)
+        self.banner_visible = False
+
         # ---------------- Indicadores grandes con mini grafica
         kpis = tk.Frame(r, bg=T.FONDO)
         kpis.pack(fill="x", padx=12)
+        self.kpis_frame = kpis
         self.kpi = {}
         for clave, titulo_k, unidad, color in (
                 ("v", "Velocidad", "m/s", T.CIAN),
@@ -192,29 +202,33 @@ class Dashboard:
         self.pestanas.add(izq, text="ODOMETRÍA")
         self.mapa_gps = mapa_gps.MapaGPS(self.pestanas, self)
         self.pestanas.add(self.mapa_gps, text="MAPA GPS")
+        # Dos filas de botones: en una sola el panel crecia y empujaba fuera de la
+        # pantalla el tablero de Sistemas (no se veia GYRO en rojo).
         botones = tk.Frame(izq, bg=T.PANEL)
-        botones.pack(fill="x", padx=8, pady=4)
+        botones.pack(fill="x", padx=8, pady=(4, 2))
         ttk.Button(botones, text="▶ Ejecutar ruta", style="Accion.TButton",
                    command=self.ejecutar_ruta).pack(side="left")
         ttk.Button(botones, text="Detener ruta", command=lambda: self.escribir("#WS")).pack(side="left", padx=3)
+        ttk.Button(botones, text="Reiniciar origen", command=self.reiniciar_origen).pack(side="left", padx=3)
         ttk.Button(botones, text="Quitar último", command=self.quitar_punto).pack(side="left", padx=3)
         ttk.Button(botones, text="Borrar puntos", command=self.borrar_puntos).pack(side="left", padx=3)
-        ttk.Button(botones, text="● Grabar punto (P / LB)", style="Accion.TButton",
-                   command=self.grabar_punto).pack(side="left", padx=3)
-        ttk.Button(botones, text="✓ Terminé en la X", command=self.termine_en_x).pack(side="left", padx=3)
-        ttk.Button(botones, text="+ X", width=4, command=self.cerrar_en_x).pack(side="left", padx=3)
-        ttk.Button(botones, text="Reiniciar origen", command=self.reiniciar_origen).pack(side="left", padx=3)
-        ttk.Checkbutton(botones, text="Seguir al carro", variable=self.seguir,
-                        style="Panel.TCheckbutton").pack(side="left", padx=8)
-        ttk.Button(botones, text="+", width=3, command=lambda: self.zoom_mapa(1.25)).pack(side="left", padx=(3, 0))
-        ttk.Button(botones, text="−", width=3, command=lambda: self.zoom_mapa(0.8)).pack(side="left")
-        ttk.Checkbutton(botones, text="Esquinas en curva", variable=self.curvas,
-                        style="Panel.TCheckbutton").pack(side="left", padx=(6, 0))
-        ttk.Label(botones, text="Vel (%)").pack(side="left", padx=(6, 2))
-        ttk.Entry(botones, width=4, textvariable=self.vel_ruta).pack(side="left")
         self.lbl_ruta = tk.Label(botones, text="0 PUNTOS", bg=T.PANEL, fg=T.ROSA,
                                  font=("Consolas", 10, "bold"))
         self.lbl_ruta.pack(side="right")
+        botones2 = tk.Frame(izq, bg=T.PANEL)
+        botones2.pack(fill="x", padx=8, pady=(0, 4))
+        ttk.Button(botones2, text="● Grabar punto (P / LB)", style="Accion.TButton",
+                   command=self.grabar_punto).pack(side="left")
+        ttk.Button(botones2, text="✓ Terminé en la X", command=self.termine_en_x).pack(side="left", padx=3)
+        ttk.Button(botones2, text="+ X", width=4, command=self.cerrar_en_x).pack(side="left", padx=3)
+        ttk.Checkbutton(botones2, text="Esquinas en curva", variable=self.curvas,
+                        style="Panel.TCheckbutton").pack(side="left", padx=(8, 0))
+        ttk.Label(botones2, text="Vel (%)").pack(side="left", padx=(6, 2))
+        ttk.Entry(botones2, width=4, textvariable=self.vel_ruta).pack(side="left")
+        ttk.Button(botones2, text="−", width=3, command=lambda: self.zoom_mapa(0.8)).pack(side="right")
+        ttk.Button(botones2, text="+", width=3, command=lambda: self.zoom_mapa(1.25)).pack(side="right", padx=(3, 0))
+        ttk.Checkbutton(botones2, text="Seguir al carro", variable=self.seguir,
+                        style="Panel.TCheckbutton").pack(side="right", padx=8)
         self.mapa = tk.Canvas(izq, bg=COLOR_MAPA, highlightthickness=0)
         self.mapa.pack(fill="both", expand=True, padx=8, pady=(0, 4))
         self.mapa.bind("<Button-1>", self.clic_mapa)
@@ -405,6 +419,13 @@ class Dashboard:
             self.mensajes.append("ERROR GYRO: sin calibrar (se movio al encender). Deja el carro quieto "
                                  "y presiona 'Recalibrar giroscopio'; la ruta no arranca sin el.")
         self.aviso_gyro = mal
+        # Franja roja arriba, imposible de no ver
+        if mal and not self.banner_visible:
+            self.banner_gyro.pack(fill="x", padx=12, pady=(0, 6), before=self.kpis_frame)
+            self.banner_visible = True
+        elif not mal and self.banner_visible:
+            self.banner_gyro.pack_forget()
+            self.banner_visible = False
 
     def calibrar_magnetometro(self):
         """Una vuelta completa con el control de angulo, ajuste de la elipse y #Q."""
@@ -526,6 +547,10 @@ class Dashboard:
             return
         if self.pose["md"] == "RUTA":
             return                             # no grabar mientras recorre la ruta
+        if self.pose.get("gy") is False:
+            self.mensajes.append("ERROR RUTA: no se grabo el punto: el giroscopio no esta calibrado "
+                                 "(sin el, el rumbo sale de los encoders y los puntos salen mal)")
+            return
         x, y = round(self.pose["x"], 2), round(self.pose["y"], 2)
         if self.puntos and math.hypot(x - self.puntos[-1][0], y - self.puntos[-1][1]) < 0.15:
             self.mensajes.append("RUTA: muy cerca del punto anterior; no se grabo")
@@ -1002,6 +1027,9 @@ class Dashboard:
             self.txt.config(state="normal")
             while self.mensajes:
                 m = self.mensajes.popleft()
+                if m == getattr(self, "ultimo_msg", None):
+                    continue                   # no repetir el mismo mensaje seguido
+                self.ultimo_msg = m
                 self.txt.insert("end", m + "\n")
                 self.lbl_ticker.config(text="▸ " + m, fg=T.ROJO if m.startswith("ERROR") else T.CIAN)
             self.txt.see("end")
