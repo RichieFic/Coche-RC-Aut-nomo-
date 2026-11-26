@@ -95,6 +95,7 @@ HUECO_B_EF_M = 0.26            # via efectiva al avanzar (m)
 HUECO_MIN_CUENTAS = 15         # la rueda buena debe contar mas que esto en el paso (20 ms)
 HUECO_TOL_CUENTAS = 10         # tolerancia fija...
 HUECO_TOL_FRACCION = 0.5       # ...mas esta fraccion de la diferencia esperada
+HUECO_MALA_MAX = 0.5           # la rueda que fallo cuenta a lo mas la mitad que la buena
 HUECO_GIRO_MAX_DPS = 15.0      # solo casi en linea recta: en curvas el patinaje varia y daria falsos huecos
 PASO_S = 0.020                 # periodo de la odometria (ODO_PERIODO_MS)
 
@@ -110,6 +111,8 @@ def corregir_hueco(d3, d4, dyaw_deg, m_por_cuenta=M_POR_CUENTA, dt=PASO_S, b_ef=
     esperado = math.radians(dyaw_deg) * b_ef / m_por_cuenta      # (der - izq) esperado
     if abs((d3 - d4) - esperado) <= HUECO_TOL_CUENTAS + HUECO_TOL_FRACCION * abs(esperado):
         return d3, d4, False
+    if min(abs(d3), abs(d4)) > HUECO_MALA_MAX * max(abs(d3), abs(d4)):
+        return d3, d4, False           # diferencia chica: patinaje normal, no un hueco
     if abs(d3) >= abs(d4):
         nuevo = d3 - esperado                                      # izquierda reconstruida
         if abs(nuevo) > abs(d4):

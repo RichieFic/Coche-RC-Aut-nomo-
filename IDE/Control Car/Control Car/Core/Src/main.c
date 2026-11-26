@@ -196,6 +196,7 @@ uint8_t odo_reinicios = 0U;            /* cuantas veces se reinicio la odometria
 #define ODO_HUECO_TOL_CUENTAS  10.0f   /* tolerancia fija... */
 #define ODO_HUECO_TOL_FRACCION 0.5f    /* ...mas esta fraccion de la diferencia esperada */
 #define ODO_HUECO_GIRO_MAX_DPS 15.0f   /* solo casi en linea recta */
+#define ODO_HUECO_MALA_MAX     0.5f    /* la rueda que fallo cuenta a lo mas la mitad (si no: patinaje) */
 uint32_t odo_huecos = 0U;              /* pasos corregidos (se manda como ef= en P:) */
 volatile uint8_t log_rx = 0xFFU;       /* 0/1 recibido por la interrupcion */
 volatile uint8_t odo_rx_reset = 0U;
@@ -1426,7 +1427,10 @@ static void OdometriaPaso(void)
         {
             float esperado = (dth / 57.2957795f) * ODO_HUECO_B_EF_M / distance_per_count;  /* der - izq */
             float error = ((float)(d3 - d4)) - esperado;
-            if (fabsf(error) > (ODO_HUECO_TOL_CUENTAS + (ODO_HUECO_TOL_FRACCION * fabsf(esperado))))
+            int16_t menor = (a3 < a4) ? a3 : a4;
+            int16_t mayor = (a3 < a4) ? a4 : a3;
+            if ((fabsf(error) > (ODO_HUECO_TOL_CUENTAS + (ODO_HUECO_TOL_FRACCION * fabsf(esperado)))) &&
+                ((float)menor <= (ODO_HUECO_MALA_MAX * (float)mayor)))
             {
                 if (a3 >= a4)
                 {
