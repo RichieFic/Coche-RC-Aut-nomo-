@@ -9,6 +9,7 @@
 #define MPU_WHO_AM_I       0x75U
 
 #define MPU_PWR_MGMT_1     0x6BU
+#define MPU_PWR_MGMT_2     0x6CU
 
 #define MPU_USER_CTRL      0x6AU
 
@@ -115,7 +116,13 @@ HAL_StatusTypeDef MPU9250_Init(I2C_HandleTypeDef *hi2c)
 
     if ((id != 0x71U) && (id != 0x73U)) return HAL_ERROR;
 
-    if (mpu_write(hi2c, MPU_PWR_MGMT_1, 0x00U) != HAL_OK) return HAL_ERROR;
+    /* Reinicio completo del chip (H_RESET): el IMU no pierde la alimentacion al
+     * reiniciar la NUCLEO, y si quedo trabado (acelerometro y giroscopio en 0 aunque
+     * WHO_AM_I conteste) solo asi vuelve a su estado de fabrica. */
+    (void)mpu_write(hi2c, MPU_PWR_MGMT_1, 0x80U);
+    HAL_Delay(100U);
+    if (mpu_write(hi2c, MPU_PWR_MGMT_1, 0x01U) != HAL_OK) return HAL_ERROR;  /* despierto, reloj PLL */
+    if (mpu_write(hi2c, MPU_PWR_MGMT_2, 0x00U) != HAL_OK) return HAL_ERROR;  /* acelerometro y giroscopio encendidos */
 
     HAL_Delay(100U);
 
