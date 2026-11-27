@@ -997,7 +997,7 @@ class Dashboard:
             r = error_m * self.escala
             c.create_oval(sx - r, sy - r, sx + r, sy + r, outline=T.AMARILLO, dash=(3, 3))
             c.create_oval(sx - 5, sy - 5, sx + 5, sy + 5, fill=T.AMARILLO, outline="#000000")
-        c.create_text(8, h - 8, text=texto, anchor="sw", fill=T.AMARILLO, font=("Consolas", 9))
+        c.create_text(72, h - 8, text=texto, anchor="sw", fill=T.AMARILLO, font=("Consolas", 9))
 
     def dibujar_mapa(self):
         c = self.mapa
