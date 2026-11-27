@@ -363,6 +363,11 @@ uint32_t giro_final_ms = 0U;
 #define DIAG_ACTIVO           0U      /* 1 = lineas DIAG: y RX_ESP: (lectura extra del giroscopio) */
 /* Giroscopio Z (giros y evasion). El magnetometro queda para rumbo absoluto. */
 #define GYRO_Z_SIGNO          1.0f    /* signo de la velocidad proyectada; cambiar a -1.0f si al girar a la derecha YAW_G sube */
+/* Escala del giroscopio por sentido (2026-11-26, estructura nueva): 5 vueltas en su
+ * lugar terminando alineado con una marca. Izquierda midio 1781.3 de 1800 grados,
+ * derecha 1786.3 de 1800. Se aplica al integrar, asi corrige rumbo, odometria y ruta. */
+#define GYRO_ESCALA_IZQ       1.0105f
+#define GYRO_ESCALA_DER       1.0077f
 #define GYRO_BIAS_MS          1500U   /* medicion del sesgo con el carro quieto */
 #define GYRO_ZUPT_ALFA        0.01f   /* ajuste lento del sesgo con las ruedas paradas */
 #define GYRO_ZUPT_MAX_DPS     3.0f    /* solo se ajusta si gira menos que esto */
@@ -2603,8 +2608,13 @@ int main(void)
                                            &suma_grados, &ultima_dps, &muestras);
                 if ((st_gyro == HAL_OK) && (muestras > 0U))
                 {
-                    yaw_gyro_deg += GYRO_Z_SIGNO * suma_grados;
-                    gyro_rate_dps = GYRO_Z_SIGNO * ultima_dps;
+                    {
+                        /* + = izquierda: cada sentido con su escala. */
+                        float d_g = GYRO_Z_SIGNO * suma_grados;
+                        float r_g = GYRO_Z_SIGNO * ultima_dps;
+                        yaw_gyro_deg += d_g * ((d_g >= 0.0f) ? GYRO_ESCALA_IZQ : GYRO_ESCALA_DER);
+                        gyro_rate_dps = r_g * ((r_g >= 0.0f) ? GYRO_ESCALA_IZQ : GYRO_ESCALA_DER);
+                    }
                     gyro_last_ok_ms = now_gyro;
                     /* Con las ruedas paradas, ajustar lentamente el sesgo. */
                     {
