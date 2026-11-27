@@ -237,9 +237,7 @@ float us_ultima_cm = -1.0f;            /* ultima lectura del ultrasonico (-1 = s
 #define RUTA_SEG_CURVA_M       0.6f    /* tramo mas corto que esto = parte de un arco */
 #define RUTA_ANTES_CURVA_M     0.4f    /* bajar la velocidad desde esta distancia antes del arco */
 #define RUTA_PASADA_MARGEN_M   0.01f   /* "ya pase": a mas de esto de la distancia minima alcanzada */
-#define RUTA_GYRO_MAX_MS       300U    /* sin lecturas del giroscopio por mas de esto: pausar la ruta */
-#define RUTA_GYRO_ABORTO_MS    5000U   /* pausada por el giroscopio mas de esto: cancelar la ruta */
-#define I2C_RECUP_MIN_MS       50U     /* como maximo una recuperacion del bus I2C cada 50 ms */
+#define RUTA_GYRO_MAX_MS       300U    /* sin lecturas del giroscopio por mas de esto: detener la ruta */
 #define RUTA_GIRO_MAX_MS       6000U   /* un pivote que dura mas que esto: detener (rueda atorada?) */
 #define RUTA_SIN_AVANCE_MS     10000U  /* sin acercarse 5 cm al punto en este tiempo: detener */
 #define RUTA_AVANCE_MIN_M      0.05f
@@ -280,8 +278,6 @@ uint8_t ruta_idx = 0U;
 uint8_t ruta_activa = 0U;
 uint8_t ruta_girando = 0U;
 uint8_t ruta_pausa_obstaculo = 0U;
-uint8_t ruta_pausa_gyro = 0U;          /* ruta en pausa porque el giroscopio no responde */
-uint32_t ruta_pausa_gyro_ms = 0U;
 uint32_t ruta_asentar_hasta = 0U;      /* fin de la pausa despues de pivotar */
 uint32_t ruta_tramo_ms = 0U;           /* inicio del tramo (para el arranque suave) */
 float ruta_integral = 0.0f;
@@ -402,8 +398,6 @@ float gyro_rate_dps = 0.0f;            /* velocidad Z con signo de montaje */
 uint32_t gyro_last_ok_ms = 0U;
 uint32_t gyro_quieto_desde_ms = 0U;
 uint32_t gyro_desbordes = 0U;
-uint32_t i2c_recuperaciones = 0U;      /* veces que se reinicio el bus I2C del IMU */
-static uint32_t i2c_recup_ms = 0U;
 uint32_t last_gyro_read_ms = 0U;
 /* DIAGNOSTICO temporal: giroscopio leido directo de registros (sin FIFO). */
 float diag_gyro_dps[3] = {0.0f, 0.0f, 0.0f};
@@ -874,39 +868,6 @@ static void DWT_Delay_us(uint32_t us)
     uint32_t start = DWT->CYCCNT;
     uint32_t ticks = (SystemCoreClock / 1000000U) * us;
     while ((DWT->CYCCNT - start) < ticks) { }
-}
-/* Recupera el bus I2C del IMU despues de un error (ruido de los motores, cable flojo):
- * 9 pulsos de reloj y un STOP para soltar al esclavo, reinicio del periferico y FIFO
- * del giroscopio vacia (tras un error las muestras pueden quedar desalineadas). */
-static void I2C1_Recuperar(void)
-{
-    GPIO_InitTypeDef gpio = {0};
-    uint8_t k;
-    uint32_t ahora = HAL_GetTick();
-
-    if ((ahora - i2c_recup_ms) < I2C_RECUP_MIN_MS) return;
-    i2c_recup_ms = ahora;
-    i2c_recuperaciones++;
-    (void)HAL_I2C_DeInit(&hi2c1);
-    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_8 | GPIO_PIN_9, GPIO_PIN_SET);
-    gpio.Pin = GPIO_PIN_8 | GPIO_PIN_9;               /* PB8 = SCL, PB9 = SDA */
-    gpio.Mode = GPIO_MODE_OUTPUT_OD;
-    gpio.Pull = GPIO_PULLUP;
-    gpio.Speed = GPIO_SPEED_FREQ_LOW;
-    HAL_GPIO_Init(GPIOB, &gpio);
-    for (k = 0U; k < 9U; k++)
-    {
-        HAL_GPIO_WritePin(GPIOB, GPIO_PIN_8, GPIO_PIN_RESET);
-        DWT_Delay_us(5U);
-        HAL_GPIO_WritePin(GPIOB, GPIO_PIN_8, GPIO_PIN_SET);
-        DWT_Delay_us(5U);
-    }
-    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_9, GPIO_PIN_RESET);   /* STOP: SDA sube con SCL alto */
-    DWT_Delay_us(5U);
-    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_9, GPIO_PIN_SET);
-    DWT_Delay_us(5U);
-    (void)HAL_I2C_Init(&hi2c1);                        /* MspInit regresa PB8/PB9 a I2C */
-    (void)MPU9250_GyroFifoReset(&hi2c1);
 }
 #if (US_NO_BLOQUEANTE == 0U)
 /* Mide la distancia (bloqueante). Si no recibe eco regresa -1 */
@@ -1572,7 +1533,7 @@ static void OdometriaPaso(void)
         odo_telemetria_ms = ahora;
         snprintf(linea, sizeof(linea),
                  "P: x=%ld y=%ld th=%ld v=%ld rd=%ld ri=%ld pd=%ld pi=%ld us=%ld md=%s wp=%u/%u"
-                 " mg=%ld mv=%u mx=%ld my=%ld mz=%ld gy=%u ef=%lu ir=%lu\r\n",
+                 " mg=%ld mv=%u mx=%ld my=%ld mz=%ld gy=%u ef=%lu\r\n",
                  (long)(odo_x_m * 1000.0f), (long)(odo_y_m * 1000.0f),
                  (long)(odo_theta_deg * 10.0f), (long)(odo_v_ms * 1000.0f),
                  (long)(rpm_motor_derecho * 10.0f), (long)(rpm_motor_izquierdo * 10.0f),
@@ -1582,7 +1543,7 @@ static void OdometriaPaso(void)
                  (long)(imu_mag_norte_deg * 10.0f), (unsigned int)imu_mag_norte_ok,
                  (long)(mv3[0] * 10.0f), (long)(mv3[1] * 10.0f), (long)(mv3[2] * 10.0f),
                  (unsigned int)(((gyro_ok != 0U) && (giro_fuente == GIRO_FUENTE_GYRO)) ? 1U : 0U),
-                 (unsigned long)odo_huecos, (unsigned long)i2c_recuperaciones);
+                 (unsigned long)odo_huecos);
         EnviarMensajeDebug(linea);
     }
 }
@@ -1606,37 +1567,13 @@ static void RutaPaso(void)
     if (dt > 0.1f) dt = 0.1f;
     ruta_ultimo_ms = ahora;
 
-    /* Vigilancia: sin giroscopio el rumbo se congela y el carro podria pivotar sin fin.
-     * Se pausa (motores parados) y sigue sola cuando el giroscopio regresa; solo se
-     * cancela si no regresa en RUTA_GYRO_ABORTO_MS. */
+    /* Vigilancia: sin giroscopio el rumbo se congela y el carro podria pivotar sin fin. */
     if ((ahora - gyro_last_ok_ms) > RUTA_GYRO_MAX_MS)
     {
-        if (ruta_pausa_gyro == 0U)
-        {
-            StopMotors();
-            ruta_pausa_gyro = 1U;
-            ruta_pausa_gyro_ms = ahora;
-            EnviarMensajeDebug("RUTA: giroscopio sin respuesta, en pausa\r\n");
-        }
-        else if ((ahora - ruta_pausa_gyro_ms) > RUTA_GYRO_ABORTO_MS)
-        {
-            StopMotors();
-            ruta_activa = 0U;
-            ruta_pausa_gyro = 0U;
-            EnviarMensajeDebug("RUTA: detenida, el giroscopio dejo de responder\r\n");
-            return;
-        }
-        ruta_chk_ms = ahora;           /* la pausa no cuenta como "atorado" */
+        StopMotors();
+        ruta_activa = 0U;
+        EnviarMensajeDebug("RUTA: detenida, el giroscopio dejo de responder\r\n");
         return;
-    }
-    if (ruta_pausa_gyro != 0U)
-    {
-        char msg_g[64];
-        ruta_pausa_gyro = 0U;
-        ruta_tramo_ms = ahora;         /* volver a arrancar suave */
-        snprintf(msg_g, sizeof(msg_g), "RUTA: giroscopio de vuelta (%lu ms), continuo\r\n",
-                 (unsigned long)(ahora - ruta_pausa_gyro_ms));
-        EnviarMensajeDebug(msg_g);
     }
 
     if (ruta_idx >= ruta_n)
@@ -2684,10 +2621,6 @@ int main(void)
                 {
                     gyro_desbordes++;
                 }
-                else if (st_gyro != HAL_OK)
-                {
-                    I2C1_Recuperar();
-                }
                 /* DIAGNOSTICO: lectura directa e integracion de Z sin FIFO. */
                 if ((DIAG_ACTIVO != 0U) &&
                     (MPU9250_GyroReadDirect(&hi2c1, diag_gyro_dps, &diag_fifo_bytes) == HAL_OK))
@@ -3674,7 +3607,6 @@ int main(void)
                 ruta_chk_dist = 1000.0f;
                 ruta_chk_ms = HAL_GetTick();
                 ruta_pausa_obstaculo = 0U;
-                ruta_pausa_gyro = 0U;
                 ruta_integral = 0.0f;
                 ruta_quieto = 0U;
                 ruta_ultimo_ms = HAL_GetTick();

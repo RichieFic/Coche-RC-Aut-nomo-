@@ -61,7 +61,6 @@ HAL_StatusTypeDef MPU9250_ReadHeading(I2C_HandleTypeDef *hi2c,
 #define MPU9250_GYRO_RATE_HZ   200.0f
 
 HAL_StatusTypeDef MPU9250_GyroInit(I2C_HandleTypeDef *hi2c);
-HAL_StatusTypeDef MPU9250_GyroFifoReset(I2C_HandleTypeDef *hi2c);
 
 /* Con el carro QUIETO, promedia el acelerometro para saber que eje del sensor
  * apunta hacia arriba. up[] = vector unitario medido (incluye Z).
