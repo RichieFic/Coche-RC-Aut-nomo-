@@ -43,9 +43,10 @@ static uint8_t asa_x_raw = 0U, asa_y_raw = 0U, asa_z_raw = 0U;
  */
 
 static float offset_x = 0.0f, offset_y = 0.0f, offset_z = 0.0f;
-/* Espera maxima por cada paso de una transferencia I2C. Con 100 ms un bus con ruido
- * trababa el lazo principal; 10 ms sobra para 96 bytes a 100 kHz. */
-#define MPU_I2C_TIMEOUT_MS   10U
+/* Espera maxima de una transferencia I2C completa. Con 100 ms un bus con ruido
+ * trababa el lazo principal. La HAL cuenta la espera para la transferencia COMPLETA
+ * (no por paso): la FIFO (96 bytes a 100 kHz) tarda ~10 ms, con 10 ms fallaba. */
+#define MPU_I2C_TIMEOUT_MS   30U
 
 
 static float scale_x = 1.0f, scale_y = 1.0f, scale_z = 1.0f;
