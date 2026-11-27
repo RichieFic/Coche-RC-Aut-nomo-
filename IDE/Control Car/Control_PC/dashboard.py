@@ -34,6 +34,7 @@ import tema_oscuro as T                        # noqa: E402  (colores y componen
 import mapa_gps                                # noqa: E402  (pestana del mapa GPS)
 import calibrar_mag                            # noqa: E402  (magnetometro de canto)
 import curvas                                  # noqa: E402  (esquinas en curva)
+import gps_odo                                 # noqa: E402  (GPS en el marco de la odometria)
 import archivos                                # noqa: E402  (guardado seguro de rutas)
 import prueba_encoders                         # noqa: E402  (prueba con las ruedas en el aire)
 
@@ -72,6 +73,7 @@ class Dashboard:
         self.serie = collections.deque(maxlen=2000)   # (t, th, v, us, rpm promedio)
         self.gps = {"estado": "sin datos"}
         self.gps_rastro = collections.deque(maxlen=3000)   # (lat, lon) con FIX
+        self.ajuste_gps = gps_odo.AjusteGPS()              # GPS <-> odometria en vivo
         self.mag = collections.deque(maxlen=200)           # (t, rumbo magnetico, valido)
         self.rumbo_linea = ""
         self.ang_linea = ""
@@ -748,6 +750,13 @@ class Dashboard:
             texto = f"ERROR PRUEBA ENCODERS: {e}"
         self.mensajes.append(texto)
 
+    @staticmethod
+    def escalar_mando(izq, der, escala):
+        """Las dos ruedas por el mismo factor (la curva no cambia), sin pasar de 100."""
+        mayor = max(abs(izq), abs(der), 1)
+        k = min(escala, 100.0 / mayor)
+        return int(round(izq * k)), int(round(der * k))
+
     def ciclo(self):
         if not self.vivo:
             return
@@ -757,11 +766,17 @@ class Dashboard:
             self.root.after(PERIODO_MS, self.ciclo)
             return
         modo = self.manejo.get()
+        # El mismo "Vel (%)" de la ruta escala el manejo manual: con 80 % (el de
+        # siempre) se maneja igual que antes; 40 % = la mitad. Shift = 100 %.
+        escala = self.velocidad_ruta() / 80.0
         if modo == "teclado":
-            vel = 1.0 if ({"shift_l", "shift_r"} & self.teclas) else cc.VEL_TECLADO
+            rapido = bool({"shift_l", "shift_r"} & self.teclas)
+            vel = 1.0 if rapido else cc.VEL_TECLADO
             acel = (vel if "w" in self.teclas else 0.0) - (vel if "s" in self.teclas else 0.0)
             giro = (1.0 if "d" in self.teclas else 0.0) - (1.0 if "a" in self.teclas else 0.0)
             izq, der = cc.mezclar(acel, giro)
+            if not rapido:
+                izq, der = self.escalar_mando(izq, der, escala)
             self.escribir(f"#M{izq},{der}")
         elif modo == "xbox" and self.xbox is not None:
             acel, giro, letras, _ = self.xbox.leer()
@@ -775,6 +790,7 @@ class Dashboard:
                 else:
                     self.enviar_letra(letra)
             izq, der = cc.mezclar(acel, giro)
+            izq, der = self.escalar_mando(izq, der, escala)
             self.escribir(f"#M{izq},{der}")
         self.refrescar()
         self.root.after(PERIODO_MS, self.ciclo)
@@ -879,6 +895,9 @@ class Dashboard:
             pos = self.gps_posicion()
             if pos and (not self.gps_rastro or pos != self.gps_rastro[-1]):
                 self.gps_rastro.append(pos)
+                if self.pose:
+                    with self.datos_lock:
+                        self.ajuste_gps.agregar(pos[0], pos[1], self.pose["x"], self.pose["y"])
         elif texto.startswith("RUMBO:"):
             self.rumbo_linea = texto[6:].strip()
         elif texto.startswith("ANG: modo="):
@@ -896,6 +915,10 @@ class Dashboard:
                                      "se detuvo. Vuelve a ejecutar la ruta.")
                 self.escribir("#WS")
             self.ruta_esperada = None
+        elif texto.startswith("ODO: posicion reiniciada"):
+            self.mensajes.append(texto)
+            with self.datos_lock:
+                self.ajuste_gps.reiniciar()        # otro marco: el ajuste viejo ya no sirve
         elif texto.startswith("Carro listo"):
             self.mensajes.append(texto)
             self.enviar_configuracion()
@@ -954,6 +977,28 @@ class Dashboard:
             self.desplazar_mapa(ev.x - x0, ev.y - y0)
             self.arrastre_medio = (ev.x, ev.y)
 
+    def dibujar_gps_en_odometria(self, c, w, h):
+        x0, psi0 = self.mapa_gps.x0, self.mapa_gps.psi0
+        with self.datos_lock:
+            pts = self.ajuste_gps.puntos_odo(x0, psi0)
+            texto = self.ajuste_gps.texto(x0, psi0)
+            gps = self.gps_posicion()
+            actual = self.ajuste_gps.gps_a_odo(*gps, x0, psi0) if gps else None
+        apagado = T.mezclar(T.AMARILLO, COLOR_MAPA, 0.45)
+        for (x, y) in pts:
+            sx, sy = self.a_pantalla(x, y)
+            c.create_oval(sx - 2, sy - 2, sx + 2, sy + 2, fill=apagado, outline="")
+        if actual:
+            sx, sy = self.a_pantalla(*actual)
+            try:
+                error_m = max(2.0, 2.5 * float(self.gps.get("HDOP", "2")))
+            except ValueError:
+                error_m = 5.0
+            r = error_m * self.escala
+            c.create_oval(sx - r, sy - r, sx + r, sy + r, outline=T.AMARILLO, dash=(3, 3))
+            c.create_oval(sx - 5, sy - 5, sx + 5, sy + 5, fill=T.AMARILLO, outline="#000000")
+        c.create_text(8, h - 8, text=texto, anchor="sw", fill=T.AMARILLO, font=("Consolas", 9))
+
     def dibujar_mapa(self):
         c = self.mapa
         c.delete("all")
@@ -997,6 +1042,9 @@ class Dashboard:
                 pts.extend(self.a_pantalla(x, y))
             c.create_line(*pts, fill=T.mezclar(T.CIAN, COLOR_MAPA, 0.25), width=6)
             c.create_line(*pts, fill=COLOR_RASTRO, width=2)
+
+        # GPS en vivo, puesto en el marco de la odometria
+        self.dibujar_gps_en_odometria(c, w, h)
 
         # Ruta: desde el carro (o el origen) por todos los puntos
         idx_actual = 0

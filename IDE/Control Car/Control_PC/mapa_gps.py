@@ -717,11 +717,26 @@ class MapaGPS(tk.Frame):
             self.pie(c, w, h, gps)
             return
 
-        # Rastro GPS
+        # Rastro GPS (linea y cada lectura como punto)
         rastro = list(self.d.gps_rastro)
         if len(rastro) >= 2:
             pts = [v for p in rastro for v in self.a_pant(*p)]
             c.create_line(*pts, fill=T.AMARILLO, width=2)
+        if self.m_por_px() < 1.0:                 # con zoom suficiente, las lecturas sueltas
+            for p in rastro[-600:]:
+                sx, sy = self.a_pant(*p)
+                c.create_oval(sx - 2, sy - 2, sx + 2, sy + 2, fill=T.AMARILLO, outline="")
+
+        # Rastro de la odometria (con la X del mapa, o alineada sola con el GPS)
+        with self.d.datos_lock:
+            rastro_o = list(self.d.rastro)
+            pts = []
+            for (x, y) in rastro_o[::2]:
+                ll = self.d.ajuste_gps.odo_a_gps(x, y, self.x0, self.psi0)
+                if ll:
+                    pts.extend(self.a_pant(*ll))
+        if len(pts) >= 4:
+            c.create_line(*pts, fill=T.CIAN, width=2)
 
         # Ruta planeada: X -> puntos -> X
         if self.x0 or self.ruta:
@@ -756,11 +771,15 @@ class MapaGPS(tk.Frame):
 
         # Carro estimado por la odometria (marco de la X)
         pose = self.d.pose
-        if pose and self.x0 and self.psi0 is not None:
-            e, n = odo_a_enu(pose["x"], pose["y"], self.psi0)
-            lat, lon = de_enu(e, n, *self.x0)
+        ajuste = self.d.ajuste_gps.ajuste
+        if pose and ((self.x0 and self.psi0 is not None) or ajuste is not None):
+            lat, lon = self.d.ajuste_gps.odo_a_gps(pose["x"], pose["y"], self.x0, self.psi0)
             sx, sy = self.a_pant(lat, lon)
-            rumbo = math.radians(self.psi0 - pose["th"])
+            if self.x0 and self.psi0 is not None:
+                psi = self.psi0
+            else:                                  # rumbo del eje x de la odometria segun el ajuste
+                psi = 90.0 - math.degrees(math.atan2(-ajuste[1], ajuste[0]))
+            rumbo = math.radians(psi - pose["th"])
             def punto(adel, lado):
                 return (sx + adel * math.sin(rumbo) + lado * math.cos(rumbo),
                         sy - adel * math.cos(rumbo) + lado * math.sin(rumbo))
