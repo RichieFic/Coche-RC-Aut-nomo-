@@ -43,6 +43,10 @@ static uint8_t asa_x_raw = 0U, asa_y_raw = 0U, asa_z_raw = 0U;
  */
 
 static float offset_x = 0.0f, offset_y = 0.0f, offset_z = 0.0f;
+/* Espera maxima por cada paso de una transferencia I2C. Con 100 ms un bus con ruido
+ * trababa el lazo principal; 10 ms sobra para 96 bytes a 100 kHz. */
+#define MPU_I2C_TIMEOUT_MS   10U
+
 
 static float scale_x = 1.0f, scale_y = 1.0f, scale_z = 1.0f;
 
@@ -54,7 +58,7 @@ static HAL_StatusTypeDef mpu_write(I2C_HandleTypeDef *hi2c,
 
     return HAL_I2C_Mem_Write(hi2c, MPU9250_ADDR, reg,
 
-                             I2C_MEMADD_SIZE_8BIT, &value, 1U, 100U);
+                             I2C_MEMADD_SIZE_8BIT, &value, 1U, MPU_I2C_TIMEOUT_MS);
 
 }
 
@@ -66,7 +70,7 @@ static HAL_StatusTypeDef ak_write(I2C_HandleTypeDef *hi2c,
 
     return HAL_I2C_Mem_Write(hi2c, AK8963_ADDR, reg,
 
-                             I2C_MEMADD_SIZE_8BIT, &value, 1U, 100U);
+                             I2C_MEMADD_SIZE_8BIT, &value, 1U, MPU_I2C_TIMEOUT_MS);
 
 }
 
@@ -78,7 +82,7 @@ static HAL_StatusTypeDef mpu_read(I2C_HandleTypeDef *hi2c,
 
     return HAL_I2C_Mem_Read(hi2c, MPU9250_ADDR, reg,
 
-                            I2C_MEMADD_SIZE_8BIT, data, len, 100U);
+                            I2C_MEMADD_SIZE_8BIT, data, len, MPU_I2C_TIMEOUT_MS);
 
 }
 
@@ -90,7 +94,7 @@ static HAL_StatusTypeDef ak_read(I2C_HandleTypeDef *hi2c,
 
     return HAL_I2C_Mem_Read(hi2c, AK8963_ADDR, reg,
 
-                            I2C_MEMADD_SIZE_8BIT, data, len, 100U);
+                            I2C_MEMADD_SIZE_8BIT, data, len, MPU_I2C_TIMEOUT_MS);
 
 }
 
@@ -394,6 +398,13 @@ static HAL_StatusTypeDef gyro_fifo_reset(I2C_HandleTypeDef *hi2c)
     if (mpu_write(hi2c, MPU_USER_CTRL, 0x40U) != HAL_OK) return HAL_ERROR; /* FIFO_EN */
     if (mpu_write(hi2c, MPU_FIFO_EN, 0x70U) != HAL_OK) return HAL_ERROR;   /* XG, YG, ZG */
     return HAL_OK;
+}
+
+/* Vacia la FIFO (tras un error de I2C las muestras pueden quedar desalineadas). */
+HAL_StatusTypeDef MPU9250_GyroFifoReset(I2C_HandleTypeDef *hi2c)
+{
+    if (hi2c == NULL) return HAL_ERROR;
+    return gyro_fifo_reset(hi2c);
 }
 
 float MPU9250_GyroProject(const float xyz_dps[3])
