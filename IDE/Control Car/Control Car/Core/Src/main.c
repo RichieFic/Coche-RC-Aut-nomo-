@@ -365,9 +365,12 @@ uint32_t giro_final_ms = 0U;
 #define GYRO_Z_SIGNO          1.0f    /* signo de la velocidad proyectada; cambiar a -1.0f si al girar a la derecha YAW_G sube */
 /* Escala del giroscopio por sentido (2026-11-26, estructura nueva): 5 vueltas en su
  * lugar terminando alineado con una marca. Izquierda midio 1781.3 de 1800 grados,
- * derecha 1786.3 de 1800. Se aplica al integrar, asi corrige rumbo, odometria y ruta. */
-#define GYRO_ESCALA_IZQ       1.0105f
-#define GYRO_ESCALA_DER       1.0077f
+ * derecha 1786.3 de 1800 (1.0105 y 1.0077). Se aplica al integrar, asi corrige rumbo,
+ * odometria y ruta. En el circuito (pendientes/baches) la ruta de 9 puntos a 80 %
+ * todavia se paso 0.70 m de la X: el replay dice que faltaba +0.85 % de giro, que
+ * se suma a las dos escalas (empirico, 2026-11-26; confirmar con otra corrida). */
+#define GYRO_ESCALA_IZQ       1.0191f
+#define GYRO_ESCALA_DER       1.0163f
 #define GYRO_BIAS_MS          1500U   /* medicion del sesgo con el carro quieto */
 #define GYRO_ZUPT_ALFA        0.01f   /* ajuste lento del sesgo con las ruedas paradas */
 #define GYRO_ZUPT_MAX_DPS     3.0f    /* solo se ajusta si gira menos que esto */
