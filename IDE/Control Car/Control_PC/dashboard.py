@@ -489,6 +489,21 @@ class Dashboard:
         if all(0 <= v <= 99.99 for v in vals):
             self.escribir("#K{},{},{}".format(*(int(round(v * 100)) for v in vals)))
 
+    def aplicar_rodeo(self, texto):
+        """El carro metio 2 puntos de paso para rodear un obstaculo (y quito los de un
+        rodeo anterior): hacer lo mismo en la copia de la ruta para dibujarla bien."""
+        m = re.search(r"quito (\d+), pongo (-?\d+),(-?\d+) (-?\d+),(-?\d+) cm en (\d+)", texto)
+        if not m:
+            return
+        quito, x1, y1, x2, y2, en = (int(v) for v in m.groups())
+        ruta = list(self.ruta_enviada)
+        if en > len(ruta):
+            return
+        del ruta[en:en + quito]
+        ruta[en:en] = [(x1 / 100.0, y1 / 100.0, True), (x2 / 100.0, y2 / 100.0, True)]
+        self.ruta_enviada = ruta
+        self.idx_parada = [k - quito + 2 if k >= en else k for k in self.idx_parada]
+
     def gps_posicion(self):
         if self.gps.get("FIX") != "1":
             return None
@@ -915,6 +930,9 @@ class Dashboard:
                                      "se detuvo. Vuelve a ejecutar la ruta.")
                 self.escribir("#WS")
             self.ruta_esperada = None
+        elif texto.startswith("RUTA: rodeo por la "):
+            self.mensajes.append(texto)
+            self.aplicar_rodeo(texto)
         elif texto.startswith("ODO: posicion reiniciada"):
             self.mensajes.append(texto)
             with self.datos_lock:

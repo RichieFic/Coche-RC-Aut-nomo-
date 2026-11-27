@@ -228,7 +228,15 @@ float us_ultima_cm = -1.0f;            /* ultima lectura del ultrasonico (-1 = s
 #define RUTA_KP_LINEA          8.0f    /* avanzando: % de diferencia entre ruedas por grado */
 #define RUTA_KD_LINEA          0.15f   /* ...y por grado/s (amortigua) */
 #define RUTA_CORR_MAX_LINEA    35.0f   /* correccion maxima entre ruedas (%) */
-#define RUTA_OBSTACULO_CM      20.0f   /* se pausa si hay algo a esta distancia o menos */
+#define RUTA_OBSTACULO_CM      35.0f   /* se frena si hay algo a esta distancia o menos */
+#define RUTA_OBST_CONFIRMA_MS  150U    /* ...y se sigue viendo este tiempo (>= 2 lecturas) */
+#define RUTA_EVADIR_ESPERA_MS  2000U   /* frenado: si sigue ahi tras esto, rodearlo */
+#define RUTA_EVADIR_ADELANTE_M 0.35f   /* rodeo: primer punto 0.35 m adelante... */
+#define RUTA_EVADIR_LADO_M     0.60f   /* ...y 0.60 m al lado (unos 60 grados, 0.7 m) */
+#define RUTA_EVADIR_PASAR_M    1.00f   /* segundo punto: 1 m mas adelante, junto al obstaculo */
+#define RUTA_EVADIR_CERCA_CM   15.0f   /* durante el rodeo solo frena si algo esta muy cerca
+                                        * (la esquina del obstaculo se ve de lado) */
+#define RUTA_EVADIR_MAX        2U      /* intentos por parada (el segundo, por el otro lado) */
 #define RUTA_ESPERA_MS_DEF     5000U   /* espera en cada waypoint (#WE<ms> la cambia) */
 #define RUTA_LLEGADA_FINAL_M   0.05f   /* paradas intermedias */
 #define RUTA_LLEGADA_META_M    0.015f  /* la meta: al poner PWM 0 el carro rueda ~1-2 cm mas
@@ -278,7 +286,13 @@ uint8_t ruta_idx = 0U;
 uint8_t ruta_activa = 0U;
 uint8_t ruta_girando = 0U;
 uint8_t ruta_pausa_obstaculo = 0U;
-uint32_t ruta_asentar_hasta = 0U;      /* fin de la pausa despues de pivotar */
+uint32_t ruta_pausa_desde = 0U;         /* inicio del frenado por obstaculo */
+uint32_t ruta_obst_desde = 0U;          /* desde cuando se ve el obstaculo (0 = no se ve) */
+uint8_t ruta_evasiones = 0U;            /* rodeos intentados antes de la siguiente parada */
+int8_t ruta_evasion_lado = 0;           /* +1 izquierda, -1 derecha (ultimo rodeo) */
+uint8_t ruta_desvio_fin = 0U;           /* indice despues de los puntos del rodeo (0 = ninguno) */
+uint8_t ruta_rodeo_avisado = 0U;
+uint32_t ruta_asentar_hasta = 0U;     /* fin de la pausa despues de pivotar */
 uint32_t ruta_tramo_ms = 0U;           /* inicio del tramo (para el arranque suave) */
 float ruta_integral = 0.0f;
 uint8_t ruta_quieto = 0U;
@@ -1556,6 +1570,118 @@ static void OdometriaPaso(void)
     }
 }
 /* ---------------- Seguimiento de la ruta por puntos ---------------- */
+/* Rodeo de un obstaculo dentro de la ruta: mete dos puntos de paso antes del punto
+ * actual (marco de la odometria) y deja que el seguimiento normal los recorra:
+ *   P1 = 0.35 m adelante y 0.60 m al lado (pivote de ~60 grados y 0.7 m),
+ *   P2 = P1 + 1 m adelante (pasa junto al obstaculo),
+ * y despues sigue al punto que tocaba. El lado es hacia donde gira la ruta despues
+ * de la parada que sigue; el segundo intento va por el otro lado. Regresa 1 si
+ * empezo el rodeo. */
+static uint8_t RutaIniciarRodeo(void)
+{
+    char m[120];
+    int8_t lado;
+    float th, fx, fy, x1, y1, x2, y2;
+    uint8_t k;
+    uint8_t quitados = 0U;
+
+    if (ruta_evasiones >= RUTA_EVADIR_MAX)
+    {
+        if (ruta_rodeo_avisado == 0U)
+        {
+            EnviarMensajeDebug("RUTA: rodeo fallido, en pausa hasta que se despeje\r\n");
+            ruta_rodeo_avisado = 1U;
+        }
+        return 0U;
+    }
+    /* Quitar lo que quede de un rodeo anterior (segundo intento). */
+    if (ruta_idx < ruta_desvio_fin)
+    {
+        quitados = (uint8_t)(ruta_desvio_fin - ruta_idx);
+        for (k = ruta_idx; (k + quitados) < ruta_n; k++)
+        {
+            ruta_x_cm[k] = ruta_x_cm[k + quitados];
+            ruta_y_cm[k] = ruta_y_cm[k + quitados];
+            ruta_paso[k] = ruta_paso[k + quitados];
+        }
+        ruta_n = (uint8_t)(ruta_n - quitados);
+        ruta_desvio_fin = 0U;
+    }
+    if ((ruta_n + 2U) > RUTA_MAX_PUNTOS)
+    {
+        ruta_evasiones = RUTA_EVADIR_MAX;
+        EnviarMensajeDebug("RUTA: sin espacio para rodear, en pausa hasta que se despeje\r\n");
+        ruta_rodeo_avisado = 1U;
+        return 0U;
+    }
+
+    if (ruta_evasiones == 0U)
+    {
+        /* Hacia donde gira la ruta en la siguiente parada (producto cruz). */
+        float giro = 0.0f;
+        uint8_t p = ruta_idx;
+        while (((p + 1U) < ruta_n) && (ruta_paso[p] != 0U)) p++;
+        if ((p + 1U) < ruta_n)
+        {
+            float ax = ((float)ruta_x_cm[p] / 100.0f) - odo_x_m;
+            float ay = ((float)ruta_y_cm[p] / 100.0f) - odo_y_m;
+            float bx = (float)(ruta_x_cm[p + 1U] - ruta_x_cm[p]) / 100.0f;
+            float by = (float)(ruta_y_cm[p + 1U] - ruta_y_cm[p]) / 100.0f;
+            giro = (ax * by) - (ay * bx);
+        }
+        lado = (giro > 0.0f) ? 1 : -1;      /* sin giro claro: por la derecha */
+    }
+    else
+    {
+        lado = (int8_t)(-ruta_evasion_lado);
+    }
+
+    th = odo_theta_deg / 57.2957795f;
+    fx = cosf(th);
+    fy = sinf(th);
+    /* izquierda = (-fy, fx) */
+    x1 = odo_x_m + (RUTA_EVADIR_ADELANTE_M * fx) - ((float)lado * RUTA_EVADIR_LADO_M * fy);
+    y1 = odo_y_m + (RUTA_EVADIR_ADELANTE_M * fy) + ((float)lado * RUTA_EVADIR_LADO_M * fx);
+    x2 = x1 + (RUTA_EVADIR_PASAR_M * fx);
+    y2 = y1 + (RUTA_EVADIR_PASAR_M * fy);
+
+    for (k = ruta_n; k > ruta_idx; k--)
+    {
+        ruta_x_cm[k + 1U] = ruta_x_cm[k - 1U];
+        ruta_y_cm[k + 1U] = ruta_y_cm[k - 1U];
+        ruta_paso[k + 1U] = ruta_paso[k - 1U];
+    }
+    ruta_x_cm[ruta_idx] = (int32_t)lroundf(x1 * 100.0f);
+    ruta_y_cm[ruta_idx] = (int32_t)lroundf(y1 * 100.0f);
+    ruta_paso[ruta_idx] = 1U;
+    ruta_x_cm[ruta_idx + 1U] = (int32_t)lroundf(x2 * 100.0f);
+    ruta_y_cm[ruta_idx + 1U] = (int32_t)lroundf(y2 * 100.0f);
+    ruta_paso[ruta_idx + 1U] = 1U;
+    ruta_n = (uint8_t)(ruta_n + 2U);
+    ruta_desvio_fin = (uint8_t)(ruta_idx + 2U);
+
+    ruta_ax = odo_x_m;
+    ruta_ay = odo_y_m;
+    ruta_girando = 0U;
+    ruta_integral = 0.0f;
+    ruta_quieto = 0U;
+    ruta_dist_prev = 1000.0f;
+    ruta_alejando = 0U;
+    ruta_chk_dist = 1000.0f;
+    ruta_chk_ms = HAL_GetTick();
+    ruta_tramo_ms = ruta_chk_ms;
+    ruta_evasiones++;
+    ruta_evasion_lado = lado;
+    /* Linea para el dashboard: quita/pone puntos en su copia de la ruta. */
+    snprintf(m, sizeof(m), "RUTA: rodeo por la %s, quito %u, pongo %ld,%ld %ld,%ld cm en %u\r\n",
+             (lado > 0) ? "izquierda" : "derecha", (unsigned int)quitados,
+             (long)ruta_x_cm[ruta_idx], (long)ruta_y_cm[ruta_idx],
+             (long)ruta_x_cm[ruta_idx + 1U], (long)ruta_y_cm[ruta_idx + 1U],
+             (unsigned int)ruta_idx);
+    EnviarMensajeDebug(m);
+    return 1U;
+}
+
 static void RutaPaso(void)
 {
     uint32_t ahora = HAL_GetTick();
@@ -1666,6 +1792,8 @@ static void RutaPaso(void)
         ruta_ax = (float)ruta_x_cm[ruta_idx] / 100.0f;
         ruta_ay = (float)ruta_y_cm[ruta_idx] / 100.0f;
         ruta_idx++;
+        ruta_evasiones = 0U;           /* en cada parada se vale volver a rodear */
+        ruta_rodeo_avisado = 0U;
         ruta_integral = 0.0f;
         ruta_quieto = 0U;
         ruta_girando = 0U;
@@ -1747,22 +1875,45 @@ static void RutaPaso(void)
         err_izq = EnvolverDeg((atan2f(obj_dy, obj_dx) * 57.2957795f) - odo_theta_deg);
     }
 
-    /* Obstaculo enfrente al avanzar: pausar hasta que se despeje. */
+    /* Obstaculo enfrente al avanzar: frenar; si se quita, seguir; si sigue ahi
+     * RUTA_EVADIR_ESPERA_MS, rodearlo (RutaIniciarRodeo). */
     if (ruta_girando == 0U)
     {
-        uint8_t hay = ((us_ultima_cm >= 2.0f) && (us_ultima_cm <= RUTA_OBSTACULO_CM)) ? 1U : 0U;
-        if ((hay != 0U) && (ruta_pausa_obstaculo == 0U))
+        float umbral = (ruta_idx < ruta_desvio_fin) ? RUTA_EVADIR_CERCA_CM : RUTA_OBSTACULO_CM;
+        uint8_t hay = ((us_ultima_cm >= 2.0f) && (us_ultima_cm <= umbral)) ? 1U : 0U;
+        if (hay == 0U)
+        {
+            ruta_obst_desde = 0U;
+        }
+        else if (ruta_obst_desde == 0U)
+        {
+            ruta_obst_desde = ahora | 1U;
+        }
+        if ((ruta_pausa_obstaculo == 0U) && (hay != 0U) &&
+            ((ahora - ruta_obst_desde) >= RUTA_OBST_CONFIRMA_MS))
         {
             StopMotors();
             ruta_pausa_obstaculo = 1U;
+            ruta_pausa_desde = ahora;
             EnviarMensajeDebug("RUTA: obstaculo enfrente, en pausa\r\n");
         }
         else if ((ruta_pausa_obstaculo != 0U) &&
-                 ((us_ultima_cm < 0.0f) || (us_ultima_cm > (RUTA_OBSTACULO_CM + 5.0f))))
+                 ((us_ultima_cm < 0.0f) || (us_ultima_cm > (umbral + 5.0f))))
         {
             ruta_pausa_obstaculo = 0U;
+            ruta_obst_desde = 0U;
             ruta_tramo_ms = ahora;     /* volver a arrancar suave */
             EnviarMensajeDebug("RUTA: camino libre, continuo\r\n");
+        }
+        else if ((ruta_pausa_obstaculo != 0U) &&
+                 ((ahora - ruta_pausa_desde) >= RUTA_EVADIR_ESPERA_MS))
+        {
+            if (RutaIniciarRodeo() != 0U)
+            {
+                ruta_pausa_obstaculo = 0U;
+                ruta_obst_desde = 0U;
+                return;                /* el siguiente paso ya va al primer punto del rodeo */
+            }
         }
         if (ruta_pausa_obstaculo != 0U)
         {
@@ -3620,6 +3771,11 @@ int main(void)
                 ruta_chk_dist = 1000.0f;
                 ruta_chk_ms = HAL_GetTick();
                 ruta_pausa_obstaculo = 0U;
+                ruta_obst_desde = 0U;
+                ruta_evasiones = 0U;
+                ruta_evasion_lado = 0;
+                ruta_desvio_fin = 0U;
+                ruta_rodeo_avisado = 0U;
                 ruta_integral = 0.0f;
                 ruta_quieto = 0U;
                 ruta_ultimo_ms = HAL_GetTick();
