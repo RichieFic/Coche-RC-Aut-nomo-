@@ -167,6 +167,8 @@ uint32_t tele_ultimo_ms = 0U;
 uint32_t tele_telemetria_ms = 0U;
 volatile uint8_t tele_rx_asistencia_nuevo = 0U;
 volatile uint8_t tele_rx_asistencia = 0U;
+volatile uint8_t ruta_rx_evadir_nuevo = 0U;   /* #E1 / #E0 */
+volatile uint8_t ruta_rx_evadir = 1U;
 /* ---- Odometria: posicion (x, y) con encoders + angulo del giroscopio ----
  * Marco: origen y direccion 0 = donde estaba el carro al arrancar o al
  * mandar #O. x = hacia adelante, y = hacia la izquierda, theta en grados con
@@ -237,6 +239,7 @@ float us_ultima_cm = -1.0f;            /* ultima lectura del ultrasonico (-1 = s
 #define RUTA_EVADIR_CERCA_CM   15.0f   /* durante el rodeo solo frena si algo esta muy cerca
                                         * (la esquina del obstaculo se ve de lado) */
 #define RUTA_EVADIR_MAX        2U      /* intentos por parada (el segundo, por el otro lado) */
+#define RUTA_PAUSA_SIN_RODEO_CM 20.0f  /* con el rodeo apagado (#E0): pausa como antes */
 #define RUTA_ESPERA_MS_DEF     5000U   /* espera en cada waypoint (#WE<ms> la cambia) */
 #define RUTA_LLEGADA_FINAL_M   0.05f   /* paradas intermedias */
 #define RUTA_LLEGADA_META_M    0.015f  /* la meta: al poner PWM 0 el carro rueda ~1-2 cm mas
@@ -292,6 +295,7 @@ uint8_t ruta_evasiones = 0U;            /* rodeos intentados antes de la siguien
 int8_t ruta_evasion_lado = 0;           /* +1 izquierda, -1 derecha (ultimo rodeo) */
 uint8_t ruta_desvio_fin = 0U;           /* indice despues de los puntos del rodeo (0 = ninguno) */
 uint8_t ruta_rodeo_avisado = 0U;
+uint8_t ruta_evadir = 1U;               /* 1 = rodear obstaculos, 0 = solo pausar (20 cm) */
 uint32_t ruta_asentar_hasta = 0U;     /* fin de la pausa despues de pivotar */
 uint32_t ruta_tramo_ms = 0U;           /* inicio del tramo (para el arranque suave) */
 float ruta_integral = 0.0f;
@@ -1879,7 +1883,8 @@ static void RutaPaso(void)
      * RUTA_EVADIR_ESPERA_MS, rodearlo (RutaIniciarRodeo). */
     if (ruta_girando == 0U)
     {
-        float umbral = (ruta_idx < ruta_desvio_fin) ? RUTA_EVADIR_CERCA_CM : RUTA_OBSTACULO_CM;
+        float umbral = (ruta_evadir == 0U) ? RUTA_PAUSA_SIN_RODEO_CM :
+                       ((ruta_idx < ruta_desvio_fin) ? RUTA_EVADIR_CERCA_CM : RUTA_OBSTACULO_CM);
         uint8_t hay = ((us_ultima_cm >= 2.0f) && (us_ultima_cm <= umbral)) ? 1U : 0U;
         if (hay == 0U)
         {
@@ -1905,7 +1910,7 @@ static void RutaPaso(void)
             ruta_tramo_ms = ahora;     /* volver a arrancar suave */
             EnviarMensajeDebug("RUTA: camino libre, continuo\r\n");
         }
-        else if ((ruta_pausa_obstaculo != 0U) &&
+        else if ((ruta_evadir != 0U) && (ruta_pausa_obstaculo != 0U) &&
                  ((ahora - ruta_pausa_desde) >= RUTA_EVADIR_ESPERA_MS))
         {
             if (RutaIniciarRodeo() != 0U)
@@ -2221,6 +2226,11 @@ static void ProcesarLineaAngulo(const volatile char *s, uint8_t len)
     {
         tele_rx_asistencia = (s[1] == '1') ? 1U : 0U;
         tele_rx_asistencia_nuevo = 1U;
+    }
+    else if ((s[0] == 'E') && (len == 2U) && ((s[1] == '0') || (s[1] == '1')))
+    {
+        ruta_rx_evadir = (s[1] == '1') ? 1U : 0U;
+        ruta_rx_evadir_nuevo = 1U;
     }
 }
 /* Interpreta "M<izq>,<der>" (sin el '#'). Se llama desde la interrupcion. */
@@ -3692,6 +3702,13 @@ int main(void)
                     SetMotoresConSigno(j_izq, j_der);
                 }
             }
+        }
+        if (ruta_rx_evadir_nuevo != 0U)
+        {
+            ruta_rx_evadir_nuevo = 0U;
+            ruta_evadir = ruta_rx_evadir;
+            EnviarMensajeDebug((ruta_evadir != 0U) ? "RUTA: rodeo de obstaculos ON\r\n"
+                                                   : "RUTA: rodeo de obstaculos OFF (solo pausa)\r\n");
         }
         if (tele_rx_asistencia_nuevo != 0U)
         {

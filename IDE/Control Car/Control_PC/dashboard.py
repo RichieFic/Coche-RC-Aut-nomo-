@@ -87,6 +87,7 @@ class Dashboard:
         self.teclas = set()
         self.xbox = None
         self.asistencia = True
+        self.evasion = True                     # rodear obstaculos en la ruta (#E1/#E0)
 
         self.csv_ruta, self.csv = self.abrir_csv()
         # Registro crudo: TODAS las lineas del carro, incluidas las L: (entradas
@@ -175,6 +176,8 @@ class Dashboard:
         self.btn_asist = ttk.Button(barra, text="Asistencia de rumbo: ON",
                                     command=self.alternar_asistencia)
         self.btn_asist.pack(side="left", padx=12)
+        self.btn_evasion = ttk.Button(barra, text="Evasión: ON", command=self.alternar_evasion)
+        self.btn_evasion.pack(side="left", padx=(0, 12))
         ttk.Button(barra, text="Probar encoders", command=self.probar_encoders).pack(side="left")
         ttk.Label(barra, text="Esc = parar   ·   Q = parar   ·   H = asistencia",
                   style="Fondo.TLabel").pack(side="right")
@@ -373,6 +376,11 @@ class Dashboard:
         self.escribir("#H1" if self.asistencia else "#H0")
         self.btn_asist.config(text=f"Asistencia de rumbo: {'ON' if self.asistencia else 'OFF'}")
 
+    def alternar_evasion(self):
+        self.evasion = not self.evasion
+        self.escribir("#E1" if self.evasion else "#E0")
+        self.btn_evasion.config(text=f"Evasión: {'ON' if self.evasion else 'OFF'}")
+
     def cambio_manejo(self):
         if self.manejo.get() == "xbox" and self.xbox is None:
             try:
@@ -397,6 +405,7 @@ class Dashboard:
         """Lo que el carro debe tener activo. Se repite cuando el carro termina de
         arrancar ("Carro listo"), porque si arranco despues de conectar se pierde."""
         self.escribir("#H1" if self.asistencia else "#H0")
+        self.escribir("#E1" if self.evasion else "#E0")
         self.escribir("#L1")                   # registro de entradas a 50 Hz
         cal = calibrar_mag.cargar()            # correccion de canto guardada
         if cal:
